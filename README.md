@@ -73,11 +73,9 @@ will change and "something new" will come on.
   pip install requests websocket-client
   ```
 
-- A command-line downloader on `PATH`: **wget** (default) or **curl**. Both ship
-  on, or are trivially installable on, modern Windows 10/11. The tool is chosen
-  by the `FETCH_TOOL` constant near the top of `kiosk_youtube_rotator.py` — set
-  it to `"curl"` if you don't have wget. (Adding another downloader means
-  teaching `build_fetch_command()` how to invoke it.)
+URL-list files are downloaded with the `requests` package (already required
+above), so **no external command-line downloader** (wget/curl) needs to be
+installed on the kiosk box.
 
 ## Quick start
 
@@ -188,9 +186,9 @@ pytest -q
 ```
 
 The test suite covers the pure logic — playlist-config parsing, the
-list-download layer (cache fallback, hard-failure, missing-downloader, partial
-downloads — all with the downloader mocked), local-filename derivation,
-fetch-command building, the combined URL pool, plus config-line parsing, file
+list-download layer (cache fallback, hard-failure, HTTP/network errors, empty
+responses — all with `requests.get` mocked), local-filename derivation,
+the combined URL pool, plus config-line parsing, file
 loading, random link selection, URL rendering, query-string handling, and Chrome
 executable lookup. The CDP/browser-control layer and the main loop are not
 unit-tested, as they need a live browser; that's integration-test territory.

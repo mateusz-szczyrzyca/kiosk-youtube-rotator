@@ -18,7 +18,6 @@ Run with:
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -407,45 +406,24 @@ class TestListFilenameForUrl:
 
 
 # ---------------------------------------------------------------------------
-# build_fetch_command
+# fetch_list  (requests.get mocked)
 # ---------------------------------------------------------------------------
 
 
-class TestBuildFetchCommand:
-    def test_wget_writes_to_part_file(self, tmp_path: Path):
-        dest = tmp_path / "out.txt"
-        cmd = ry.build_fetch_command("wget", "https://x/list.txt", dest)
-        assert cmd[0] == "wget"
-        assert "https://x/list.txt" in cmd
-        assert str(dest) + ".part" in cmd
+class _FakeResponse:
+    """Minimal stand-in for a requests.Response.
 
-    def test_curl_writes_to_part_file(self, tmp_path: Path):
-        dest = tmp_path / "out.txt"
-        cmd = ry.build_fetch_command("curl", "https://x/list.txt", dest)
-        assert cmd[0] == "curl"
-        assert "-fsSL" in cmd
-        assert str(dest) + ".part" in cmd
+    `status` drives raise_for_status(): any value >= 400 raises, mirroring how
+    requests rejects HTTP error responses so fetch_list() keeps the cache.
+    """
 
-    def test_exe_suffix_recognized(self, tmp_path: Path):
-        dest = tmp_path / "out.txt"
-        cmd = ry.build_fetch_command("curl.exe", "https://x/list.txt", dest)
-        assert cmd[0] == "curl.exe"
-        assert "-fsSL" in cmd  # recognized as curl despite the .exe
+    def __init__(self, content: bytes = b"", status: int = 200):
+        self.content = content
+        self.status_code = status
 
-    def test_unknown_tool_raises(self, tmp_path: Path):
-        with pytest.raises(ValueError):
-            ry.build_fetch_command("aria2c", "https://x/list.txt", tmp_path / "o.txt")
-
-
-# ---------------------------------------------------------------------------
-# fetch_list  (subprocess.run mocked)
-# ---------------------------------------------------------------------------
-
-
-class _FakeProc:
-    def __init__(self, returncode: int):
-        self.returncode = returncode
-        self.stderr = b""
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
 
 
 class TestFetchList:
@@ -453,15 +431,13 @@ class TestFetchList:
         url = "https://x/jazz.txt"
         dest = tmp_path / ry.list_filename_for_url(url)
 
-        def fake_run(cmd, **kwargs):
-            # Emulate the downloader creating the ".part" file.
-            tmp = Path(cmd[cmd.index(str(dest) + ".part")])
-            tmp.write_text("https://youtu.be/abc\n", encoding="utf-8")
-            return _FakeProc(0)
+        monkeypatch.setattr(
+            ry.requests,
+            "get",
+            lambda u, **k: _FakeResponse(b"https://youtu.be/abc\n"),
+        )
 
-        monkeypatch.setattr(ry.subprocess, "run", fake_run)
-
-        assert ry.fetch_list(url, tmp_path, tool="wget") is True
+        assert ry.fetch_list(url, tmp_path) is True
         assert dest.exists()
         assert dest.read_text(encoding="utf-8").strip() == "https://youtu.be/abc"
         # The .part temp file must have been renamed away.
@@ -474,40 +450,44 @@ class TestFetchList:
         dest = tmp_path / ry.list_filename_for_url(url)
         dest.write_text("https://youtu.be/cached\n", encoding="utf-8")
 
-        # Downloader "fails": non-zero exit, no .part file produced.
-        monkeypatch.setattr(ry.subprocess, "run", lambda cmd, **k: _FakeProc(1))
+        # Server "fails" with an HTTP error -> raise_for_status() rejects it.
+        monkeypatch.setattr(
+            ry.requests, "get", lambda u, **k: _FakeResponse(b"oops", status=500)
+        )
 
-        assert ry.fetch_list(url, tmp_path, tool="wget") is False
+        assert ry.fetch_list(url, tmp_path) is False
         # Old cached content is untouched.
+        assert dest.read_text(encoding="utf-8").strip() == "https://youtu.be/cached"
+
+    def test_network_error_with_cache_keeps_old(self, tmp_path: Path, monkeypatch):
+        url = "https://x/jazz.txt"
+        dest = tmp_path / ry.list_filename_for_url(url)
+        dest.write_text("https://youtu.be/cached\n", encoding="utf-8")
+
+        def boom(u, **k):
+            raise ry.requests.RequestException("connection refused")
+
+        monkeypatch.setattr(ry.requests, "get", boom)
+
+        assert ry.fetch_list(url, tmp_path) is False
         assert dest.read_text(encoding="utf-8").strip() == "https://youtu.be/cached"
 
     def test_failure_without_cache_raises(self, tmp_path: Path, monkeypatch):
         url = "https://x/jazz.txt"
-        monkeypatch.setattr(ry.subprocess, "run", lambda cmd, **k: _FakeProc(1))
+        monkeypatch.setattr(
+            ry.requests, "get", lambda u, **k: _FakeResponse(b"oops", status=404)
+        )
         with pytest.raises(RuntimeError):
-            ry.fetch_list(url, tmp_path, tool="wget")
-
-    def test_missing_downloader_raises_runtimeerror(self, tmp_path: Path, monkeypatch):
-        def boom(cmd, **kwargs):
-            raise FileNotFoundError("wget not found")
-
-        monkeypatch.setattr(ry.subprocess, "run", boom)
-        with pytest.raises(RuntimeError):
-            ry.fetch_list("https://x/jazz.txt", tmp_path, tool="wget")
+            ry.fetch_list(url, tmp_path)
 
     def test_empty_download_treated_as_failure(self, tmp_path: Path, monkeypatch):
         url = "https://x/jazz.txt"
-        dest = tmp_path / ry.list_filename_for_url(url)
 
-        def fake_run(cmd, **kwargs):
-            # Creates an EMPTY .part file -> must be treated as a failed download.
-            Path(str(dest) + ".part").write_text("", encoding="utf-8")
-            return _FakeProc(0)
-
-        monkeypatch.setattr(ry.subprocess, "run", fake_run)
+        # 200 OK but an empty body -> must be treated as a failed download.
+        monkeypatch.setattr(ry.requests, "get", lambda u, **k: _FakeResponse(b""))
         # No cache + empty result -> hard error.
         with pytest.raises(RuntimeError):
-            ry.fetch_list(url, tmp_path, tool="wget")
+            ry.fetch_list(url, tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -519,7 +499,7 @@ class TestRefreshLists:
     def test_counts_fresh_downloads(self, tmp_path: Path, monkeypatch):
         calls = {"n": 0}
 
-        def fake_fetch(url, dest_dir, tool=ry.FETCH_TOOL):
+        def fake_fetch(url, dest_dir):
             calls["n"] += 1
             # First url "fresh", second "cached".
             return calls["n"] == 1
@@ -530,7 +510,7 @@ class TestRefreshLists:
         assert calls["n"] == 2
 
     def test_propagates_hard_failure(self, tmp_path: Path, monkeypatch):
-        def fake_fetch(url, dest_dir, tool=ry.FETCH_TOOL):
+        def fake_fetch(url, dest_dir):
             raise RuntimeError("no cache")
 
         monkeypatch.setattr(ry, "fetch_list", fake_fetch)

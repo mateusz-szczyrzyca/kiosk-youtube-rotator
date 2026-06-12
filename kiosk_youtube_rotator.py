@@ -68,7 +68,8 @@ Dependencies
 ------------
     pip install requests websocket-client
 
-Plus a command-line downloader on PATH: wget (default) or curl. See FETCH_TOOL.
+URL-list files are downloaded with `requests`, so no external command-line
+downloader (wget/curl) needs to be present on the kiosk box.
 """
 
 from __future__ import annotations
@@ -103,17 +104,10 @@ DEFAULT_LISTS_REFRESH_INTERVAL: int = 300  # seconds (5 minutes)
 # fall back to whatever copy is already present here.
 DEFAULT_LISTS_DIR_NAME: str = "downloaded_lists"
 
-# External program used to download the URL-list files.
-#
-# We shell out to a downloader rather than using `requests` directly so the
-# fetch behaves like a plain command-line download (easy to reason about on a
-# kiosk box, honours system proxy settings, etc.). Both wget and curl ship on,
-# or are trivially installable on, modern Windows 10/11; pick whichever you
-# have. Switch this constant to "curl" if wget is not available.
-#
-# The matching argv is built in build_fetch_command(); if you point this at a
-# different tool you must teach that function how to invoke it.
-FETCH_TOOL: str = "wget"
+# How long (seconds) a single URL-list download is allowed to take before it is
+# treated as a failure. requests applies this to both connect and read phases,
+# so a hung server cannot stall the refresher thread or initial startup.
+LISTS_FETCH_TIMEOUT: float = 60.0
 
 
 # -------------------------
@@ -808,38 +802,14 @@ def list_filename_for_url(url: str) -> str:
     return f"{digest}_{base}"
 
 
-def build_fetch_command(tool: str, url: str, dest: Path) -> List[str]:
-    """Build the argv for downloading `url` to `dest` using `tool`.
-
-    Supports the two tools that are realistic on a Windows kiosk box: "wget"
-    and "curl". Both are told to follow redirects, fail (non-zero exit) on HTTP
-    errors, and write to a temporary file so a failed/partial download never
-    clobbers a previously good cached copy.
-
-    Raises ValueError for an unknown tool.
-    """
-    tmp = str(dest) + ".part"
-    name = os.path.basename(tool).lower()
-    # Strip a trailing ".exe" so "curl.exe" / "wget.exe" are recognised too.
-    if name.endswith(".exe"):
-        name = name[:-4]
-
-    if name == "wget":
-        # -q quiet, -O output file, --max-redirect follow redirects.
-        return [tool, "-q", "-O", tmp, "--max-redirect=5", url]
-    if name == "curl":
-        # -f fail on HTTP errors, -s silent, -S still show errors, -L follow
-        # redirects, -o output file.
-        return [tool, "-fsSL", "-o", tmp, url]
-
-    raise ValueError(
-        f"Unsupported fetch tool '{tool}'. Supported: 'wget', 'curl'. "
-        f"Update build_fetch_command() to add another."
-    )
-
-
-def fetch_list(url: str, dest_dir: Path, tool: str = FETCH_TOOL) -> bool:
+def fetch_list(url: str, dest_dir: Path) -> bool:
     """Download a single remote URL-list file into dest_dir.
+
+    Uses the `requests` library directly (already a dependency for the CDP
+    layer) so the kiosk box needs no external downloader on PATH. The download
+    follows redirects, treats any non-2xx HTTP status as a failure, and is
+    written to a ".part" temp file that is atomically promoted only on success,
+    so a failed/partial download never clobbers a previously good cached copy.
 
     Returns True if a fresh copy was downloaded, False if the download failed
     but a previously cached copy already exists (in which case the old copy is
@@ -852,21 +822,19 @@ def fetch_list(url: str, dest_dir: Path, tool: str = FETCH_TOOL) -> bool:
     dest = dest_dir / list_filename_for_url(url)
     tmp = dest.with_name(dest.name + ".part")
 
-    cmd = build_fetch_command(tool, url, dest)
+    ok = False
     try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            timeout=60,
-        )
-        ok = proc.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0
-    except FileNotFoundError as exc:
-        # The downloader itself is missing from PATH.
-        raise RuntimeError(
-            f"Fetch tool '{tool}' not found. Install it or change FETCH_TOOL."
-        ) from exc
-    except Exception as exc:  # subprocess timeout, etc.
+        resp = requests.get(url, timeout=LISTS_FETCH_TIMEOUT, allow_redirects=True)
+        # Any 4xx/5xx must be a failure so we keep the cache instead of caching
+        # an error page; raise_for_status() turns those into an exception.
+        resp.raise_for_status()
+        content = resp.content
+        # An empty body is treated as a failed download (mirrors the previous
+        # behaviour) so an empty response never replaces a good cached list.
+        if content:
+            tmp.write_bytes(content)
+            ok = tmp.exists() and tmp.stat().st_size > 0
+    except Exception as exc:  # network error, timeout, HTTP error, etc.
         ok = False
         print(f"[WARN] Download error for {url}: {exc}", file=sys.stderr)
 
@@ -892,7 +860,7 @@ def fetch_list(url: str, dest_dir: Path, tool: str = FETCH_TOOL) -> bool:
     raise RuntimeError(f"Failed to download {url} and no cached copy exists.")
 
 
-def refresh_lists(list_urls: List[str], dest_dir: Path, tool: str = FETCH_TOOL) -> int:
+def refresh_lists(list_urls: List[str], dest_dir: Path) -> int:
     """Download all remote URL-list files. Returns how many were freshly fetched.
 
     A failure on any single list is fatal only when that list has no cached
@@ -900,7 +868,7 @@ def refresh_lists(list_urls: List[str], dest_dir: Path, tool: str = FETCH_TOOL) 
     """
     fetched = 0
     for url in list_urls:
-        if fetch_list(url, dest_dir, tool=tool):
+        if fetch_list(url, dest_dir):
             fetched += 1
     return fetched
 
@@ -1093,7 +1061,7 @@ def main() -> None:
     # from a previous cache or from --urls). A hard failure is raised by
     # load_all_urls() below only if the pool ends up empty.
     try:
-        refresh_lists(list_urls, lists_dir, tool=FETCH_TOOL)
+        refresh_lists(list_urls, lists_dir)
     except Exception as exc:
         print(f"[WARN] Initial list download incomplete: {exc}", file=sys.stderr)
 
@@ -1112,7 +1080,7 @@ def main() -> None:
     def lists_refresher() -> None:
         while not stop_event.wait(args.lists_refresh_interval):
             try:
-                fetched = refresh_lists(list_urls, lists_dir, tool=FETCH_TOOL)
+                fetched = refresh_lists(list_urls, lists_dir)
                 print(f"[INFO] Refreshed URL lists ({fetched} updated).")
             except Exception as exc:
                 # Never let a refresh failure kill the thread or the program;
