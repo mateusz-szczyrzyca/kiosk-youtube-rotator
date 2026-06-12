@@ -83,11 +83,12 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from websocket import WebSocket, create_connection
@@ -108,6 +109,24 @@ DEFAULT_LISTS_DIR_NAME: str = "downloaded_lists"
 # treated as a failure. requests applies this to both connect and read phases,
 # so a hung server cannot stall the refresher thread or initial startup.
 LISTS_FETCH_TIMEOUT: float = 60.0
+
+# Sub-directory name (under the system temp dir) where the HTTP conditional-request
+# validators (ETag / Last-Modified) for each downloaded list are cached. These let
+# us ask the server "only send the body if it changed" (If-None-Match /
+# If-Modified-Since) instead of re-downloading every time. They live in the temp
+# dir on purpose: losing them only costs one extra full download, so a
+# system-dependent, possibly-volatile location is perfectly acceptable.
+DEFAULT_VALIDATORS_DIR_NAME: str = "kiosk_youtube_rotator_meta"
+
+
+def default_validators_dir() -> Path:
+    """Return the default directory for cached conditional-request validators.
+
+    Resolved from the system temp dir (``tempfile.gettempdir()``), which honors
+    ``TMPDIR``/``TEMP``/``TMP`` so the location stays flexible per platform and
+    per environment.
+    """
+    return Path(tempfile.gettempdir()) / DEFAULT_VALIDATORS_DIR_NAME
 
 
 # -------------------------
@@ -873,6 +892,220 @@ def refresh_lists(list_urls: List[str], dest_dir: Path) -> int:
     return fetched
 
 
+# -------------------------
+# Conditional (ETag / Last-Modified) downloading
+# -------------------------
+#
+# fetch_list() above always downloads the full body. The functions below add an
+# opt-in, "smarter" path used by the background refresher: they remember the
+# server's validators (ETag / Last-Modified) for each list and replay them as
+# If-None-Match / If-Modified-Since on the next request. The server then answers
+# "304 Not Modified" (empty body) when nothing changed, so we only pull — and
+# only log "remote newer" — when the remote copy is genuinely newer. The
+# original fetch_list()/refresh_lists() are left untouched.
+
+
+def validators_path_for_url(meta_dir: Path, url: str) -> Path:
+    """Path of the JSON sidecar holding the conditional-request validators.
+
+    Reuses ``list_filename_for_url`` so the sidecar is keyed by the same stable,
+    collision-free name as the cached list itself.
+    """
+    return meta_dir / (list_filename_for_url(url) + ".meta.json")
+
+
+def read_validators(meta_dir: Path, url: str) -> Dict[str, str]:
+    """Read cached validators for ``url``; return ``{}`` if absent or unreadable.
+
+    A missing/corrupt sidecar must never break a refresh: we simply fall back to
+    an unconditional download, which still works (just costs one body).
+    """
+    path = validators_path_for_url(meta_dir, url)
+    try:
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    # Keep only the string-valued keys we understand.
+    out: Dict[str, str] = {}
+    for key in ("etag", "last_modified"):
+        val = data.get(key)
+        if isinstance(val, str) and val:
+            out[key] = val
+    return out
+
+
+def write_validators(
+    meta_dir: Path,
+    url: str,
+    etag: Optional[str],
+    last_modified: Optional[str],
+) -> None:
+    """Persist the server validators for ``url`` (atomic, best-effort).
+
+    Only the headers the server actually sent are stored. Written to a ``.part``
+    temp file and ``os.replace``d in, mirroring the atomic-download invariant so
+    a crash mid-write never leaves a corrupt sidecar.
+    """
+    payload: Dict[str, str] = {}
+    if etag:
+        payload["etag"] = etag
+    if last_modified:
+        payload["last_modified"] = last_modified
+
+    path = validators_path_for_url(meta_dir, url)
+    try:
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        if not payload:
+            # Nothing to remember (server sent no validators); drop any stale
+            # sidecar so we don't send outdated conditional headers next time.
+            if path.exists():
+                path.unlink()
+            return
+        tmp = path.with_name(path.name + ".part")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception as exc:  # never let validator caching break a refresh
+        print(f"[WARN] Could not store validators for {url}: {exc}", file=sys.stderr)
+
+
+def fetch_list_conditional(url: str, dest_dir: Path, meta_dir: Path) -> str:
+    """Conditionally download a remote URL-list file.
+
+    Uses cached ETag / Last-Modified validators (when both a cached copy and a
+    sidecar exist) to send If-None-Match / If-Modified-Since, so the server can
+    answer "304 Not Modified" without resending the body. Only when the remote
+    copy is genuinely newer is the body downloaded, the cache atomically
+    replaced, and an ``[INFO]`` "remote newer" line logged.
+
+    Returns one of:
+    - ``"updated"``   - a new body was downloaded and the cache replaced,
+    - ``"unchanged"`` - the remote copy matched the cache (304, or identical
+      bytes from a server that sends no validators); the cache is kept,
+    - ``"cached"``    - the download failed but a cached copy exists; kept.
+
+    Raises RuntimeError if the download fails AND no cached copy exists, matching
+    fetch_list()'s contract.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / list_filename_for_url(url)
+    tmp = dest.with_name(dest.name + ".part")
+
+    had_cache = dest.exists()
+    # Conditional headers only make sense when we actually have something cached
+    # to compare against; otherwise we must fetch the full body anyway.
+    headers: Dict[str, str] = {}
+    if had_cache:
+        validators = read_validators(meta_dir, url)
+        if validators.get("etag"):
+            headers["If-None-Match"] = validators["etag"]
+        if validators.get("last_modified"):
+            headers["If-Modified-Since"] = validators["last_modified"]
+
+    content: Optional[bytes] = None
+    new_etag: Optional[str] = None
+    new_last_modified: Optional[str] = None
+    try:
+        resp = requests.get(
+            url,
+            timeout=LISTS_FETCH_TIMEOUT,
+            allow_redirects=True,
+            headers=headers or None,
+        )
+        # 304 must be handled before raise_for_status(): the server is telling us
+        # the cached copy is still current, so there is nothing to download.
+        if getattr(resp, "status_code", None) == 304 and had_cache:
+            return "unchanged"
+        resp.raise_for_status()
+        resp_headers = getattr(resp, "headers", {}) or {}
+        new_etag = resp_headers.get("ETag")
+        new_last_modified = resp_headers.get("Last-Modified")
+        body = resp.content
+        # An empty body is treated as a failed download so it never replaces a
+        # good cached list (mirrors fetch_list()).
+        if body:
+            content = body
+    except Exception as exc:  # network error, timeout, HTTP error, etc.
+        print(f"[WARN] Download error for {url}: {exc}", file=sys.stderr)
+        content = None
+
+    if content is not None:
+        # Some servers send no validators; in that case a 200 always carries a
+        # body. Compare against the cache so we don't falsely announce "newer"
+        # when the bytes are actually identical.
+        if had_cache:
+            try:
+                if dest.read_bytes() == content:
+                    # Still refresh the validators so future requests can 304.
+                    write_validators(meta_dir, url, new_etag, new_last_modified)
+                    return "unchanged"
+            except Exception:
+                # If we cannot read the cache for comparison, treat as changed.
+                pass
+
+        try:
+            tmp.write_bytes(content)
+            os.replace(tmp, dest)
+        except Exception as exc:
+            print(f"[WARN] Failed to store downloaded list {url}: {exc}", file=sys.stderr)
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+            # Fall through to the cache-or-raise handling below.
+        else:
+            write_validators(meta_dir, url, new_etag, new_last_modified)
+            if had_cache:
+                print(f"[INFO] {url}: remote newer than local cache; updated {dest}.")
+            else:
+                print(f"[INFO] Downloaded {url} (initial).")
+            return "updated"
+
+    # Download failed (or could not be stored). Clean up any partial file.
+    try:
+        if tmp.exists():
+            tmp.unlink()
+    except Exception:
+        pass
+
+    if dest.exists():
+        print(
+            f"[WARN] Could not download {url}; using cached copy at {dest}.",
+            file=sys.stderr,
+        )
+        return "cached"
+
+    raise RuntimeError(f"Failed to download {url} and no cached copy exists.")
+
+
+def refresh_lists_conditional(
+    list_urls: List[str],
+    dest_dir: Path,
+    meta_dir: Path,
+) -> Tuple[int, int]:
+    """Conditionally refresh all remote URL-list files.
+
+    Returns a ``(updated, unchanged)`` tuple: how many lists were freshly
+    downloaded because the remote copy was newer, and how many were left as-is
+    (304 / identical bytes / kept cache on failure).
+
+    A failure on any single list is fatal only when that list has no cached
+    copy (fetch_list_conditional raises); otherwise the cached copy is kept.
+    """
+    updated = 0
+    unchanged = 0
+    for url in list_urls:
+        if fetch_list_conditional(url, dest_dir, meta_dir) == "updated":
+            updated += 1
+        else:
+            unchanged += 1
+    return updated, unchanged
+
+
 def load_all_urls(
     lists_dir: Path,
     extra_urls_path: Optional[Path] = None,
@@ -950,6 +1183,17 @@ def main() -> None:
         help=(
             "Directory for cached downloaded lists "
             f"(default: ./{DEFAULT_LISTS_DIR_NAME})."
+        ),
+    )
+    parser.add_argument(
+        "--validators-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory for cached HTTP conditional-request validators "
+            "(ETag/Last-Modified), used so lists are only re-downloaded when the "
+            "remote copy is newer. Default: a per-system temp dir "
+            f"(<tempdir>/{DEFAULT_VALIDATORS_DIR_NAME})."
         ),
     )
     parser.add_argument(
@@ -1046,6 +1290,7 @@ def main() -> None:
     config_path = Path(args.config)
     base_dir = Path.cwd()
     lists_dir = Path(args.lists_dir) if args.lists_dir else base_dir / DEFAULT_LISTS_DIR_NAME
+    validators_dir = Path(args.validators_dir) if args.validators_dir else default_validators_dir()
     extra_urls_path = Path(args.urls) if args.urls else None
 
     # Read the list of remote URL-list files to keep in sync.
@@ -1061,7 +1306,7 @@ def main() -> None:
     # from a previous cache or from --urls). A hard failure is raised by
     # load_all_urls() below only if the pool ends up empty.
     try:
-        refresh_lists(list_urls, lists_dir)
+        refresh_lists_conditional(list_urls, lists_dir, validators_dir)
     except Exception as exc:
         print(f"[WARN] Initial list download incomplete: {exc}", file=sys.stderr)
 
@@ -1080,8 +1325,13 @@ def main() -> None:
     def lists_refresher() -> None:
         while not stop_event.wait(args.lists_refresh_interval):
             try:
-                fetched = refresh_lists(list_urls, lists_dir)
-                print(f"[INFO] Refreshed URL lists ({fetched} updated).")
+                updated, unchanged = refresh_lists_conditional(
+                    list_urls, lists_dir, validators_dir
+                )
+                print(
+                    f"[INFO] Refreshed URL lists ({updated} updated, "
+                    f"{unchanged} unchanged)."
+                )
             except Exception as exc:
                 # Never let a refresh failure kill the thread or the program;
                 # the cached copies remain usable.

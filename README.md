@@ -33,9 +33,16 @@ will change and "something new" will come on.
 ## How it works
 
 - Reads a **`--config` file** that lists *remote playlist URLs* (one per line).
-- A **background thread** downloads each playlist every few minutes (default 5;
+- A **background thread** refreshes each playlist every few minutes (default 5;
   see `--lists-refresh-interval`) into a local cache directory
-  (`./downloaded_lists`) that survives restarts.
+  (`./downloaded_lists`) that survives restarts. The refresh uses **HTTP
+  conditional requests** (`ETag` / `Last-Modified`), so a playlist is only
+  re-downloaded when the remote copy is actually **newer** — and when that
+  happens it's logged, e.g.
+  `[INFO] https://.../cams.txt: remote newer than local cache; updated ...`.
+  The validators it remembers between checks are cached in a per-system temp
+  directory (see `--validators-dir`); losing them only costs one extra full
+  download.
 - The rotation loop draws random links from the **combined pool** of all cached
   playlists plus an optional **local `--urls` file**.
 - Launches Chrome in kiosk mode with the **Chrome DevTools Protocol (CDP)**
@@ -56,6 +63,10 @@ will change and "something new" will come on.
 - If a playlist has **no cached copy and cannot be downloaded**, and there are
   no other usable links, the program exits with an error rather than spinning on
   an empty pool.
+- Refreshes are **conditional**: when the remote copy is unchanged the server
+  replies `304 Not Modified` and the cached copy is kept untouched. Servers that
+  send no validators are handled too — the freshly downloaded bytes are compared
+  against the cache, so an identical body is never re-announced as "newer".
 
 > **Platform:** Chrome control is built around Windows (process handling,
 > `tasklist`/`taskkill`, the default profile path). The parsing, downloading and
@@ -161,6 +172,7 @@ https://www.youtube.com/watch?v=ygedg03NpUQ
 | `--urls PATH` | none | Optional local playlist file; its links are merged into the pool. |
 | `--lists-refresh-interval SEC` | `300` | How often to re-download the playlists in the background. |
 | `--lists-dir PATH` | `./downloaded_lists` | Where to cache downloaded playlists. |
+| `--validators-dir PATH` | per-system temp dir | Where to cache HTTP conditional-request validators (ETag/Last-Modified) so lists are only re-downloaded when the remote is newer. |
 | `--min-delay SEC` | `120` | Minimum delay between switches. |
 | `--max-delay SEC` | `600` | Maximum delay between switches. |
 | `--handoff-delay SEC` | `0` | Extra wait *after* the next page has loaded, before swapping. |

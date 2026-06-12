@@ -415,11 +415,19 @@ class _FakeResponse:
 
     `status` drives raise_for_status(): any value >= 400 raises, mirroring how
     requests rejects HTTP error responses so fetch_list() keeps the cache.
+    `headers` carries response validators (ETag/Last-Modified) for the
+    conditional-download path.
     """
 
-    def __init__(self, content: bytes = b"", status: int = 200):
+    def __init__(
+        self,
+        content: bytes = b"",
+        status: int = 200,
+        headers: dict | None = None,
+    ):
         self.content = content
         self.status_code = status
+        self.headers = headers or {}
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -516,6 +524,192 @@ class TestRefreshLists:
         monkeypatch.setattr(ry, "fetch_list", fake_fetch)
         with pytest.raises(RuntimeError):
             ry.refresh_lists(["https://x/a.txt"], tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# read_validators / write_validators
+# ---------------------------------------------------------------------------
+
+
+class TestValidators:
+    def test_round_trip(self, tmp_path: Path):
+        url = "https://x/jazz.txt"
+        ry.write_validators(tmp_path, url, etag='"abc"', last_modified="Mon, 01 Jan 2024 00:00:00 GMT")
+        got = ry.read_validators(tmp_path, url)
+        assert got == {
+            "etag": '"abc"',
+            "last_modified": "Mon, 01 Jan 2024 00:00:00 GMT",
+        }
+
+    def test_missing_returns_empty(self, tmp_path: Path):
+        assert ry.read_validators(tmp_path, "https://x/missing.txt") == {}
+
+    def test_corrupt_returns_empty(self, tmp_path: Path):
+        url = "https://x/jazz.txt"
+        path = ry.validators_path_for_url(tmp_path, url)
+        path.write_text("{not json", encoding="utf-8")
+        assert ry.read_validators(tmp_path, url) == {}
+
+    def test_only_present_headers_are_stored(self, tmp_path: Path):
+        url = "https://x/jazz.txt"
+        ry.write_validators(tmp_path, url, etag='"only-etag"', last_modified=None)
+        assert ry.read_validators(tmp_path, url) == {"etag": '"only-etag"'}
+
+    def test_empty_validators_removes_stale_sidecar(self, tmp_path: Path):
+        url = "https://x/jazz.txt"
+        ry.write_validators(tmp_path, url, etag='"abc"', last_modified=None)
+        # A subsequent response with no validators must drop the stale sidecar.
+        ry.write_validators(tmp_path, url, etag=None, last_modified=None)
+        assert ry.read_validators(tmp_path, url) == {}
+        assert not ry.validators_path_for_url(tmp_path, url).exists()
+
+
+# ---------------------------------------------------------------------------
+# fetch_list_conditional  (requests.get mocked)
+# ---------------------------------------------------------------------------
+
+
+class TestFetchListConditional:
+    def test_initial_download_writes_cache_and_validators(self, tmp_path: Path, monkeypatch, capsys):
+        url = "https://x/jazz.txt"
+        lists_dir = tmp_path / "lists"
+        meta_dir = tmp_path / "meta"
+        dest = lists_dir / ry.list_filename_for_url(url)
+
+        def fake_get(u, **k):
+            # First request: no conditional headers should be sent yet.
+            assert not k.get("headers")
+            return _FakeResponse(
+                b"https://youtu.be/abc\n",
+                headers={"ETag": '"v1"', "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT"},
+            )
+
+        monkeypatch.setattr(ry.requests, "get", fake_get)
+
+        assert ry.fetch_list_conditional(url, lists_dir, meta_dir) == "updated"
+        assert dest.read_text(encoding="utf-8").strip() == "https://youtu.be/abc"
+        assert ry.read_validators(meta_dir, url) == {
+            "etag": '"v1"',
+            "last_modified": "Mon, 01 Jan 2024 00:00:00 GMT",
+        }
+        out = capsys.readouterr().out
+        assert "(initial)" in out
+        assert "remote newer" not in out
+
+    def test_not_modified_keeps_cache(self, tmp_path: Path, monkeypatch, capsys):
+        url = "https://x/jazz.txt"
+        lists_dir = tmp_path / "lists"
+        meta_dir = tmp_path / "meta"
+        lists_dir.mkdir()
+        dest = lists_dir / ry.list_filename_for_url(url)
+        dest.write_text("https://youtu.be/cached\n", encoding="utf-8")
+        ry.write_validators(meta_dir, url, etag='"v1"', last_modified=None)
+
+        def fake_get(u, **k):
+            # The stored ETag must be replayed as If-None-Match.
+            assert k.get("headers", {}).get("If-None-Match") == '"v1"'
+            return _FakeResponse(b"", status=304)
+
+        monkeypatch.setattr(ry.requests, "get", fake_get)
+
+        assert ry.fetch_list_conditional(url, lists_dir, meta_dir) == "unchanged"
+        assert dest.read_text(encoding="utf-8").strip() == "https://youtu.be/cached"
+        assert "remote newer" not in capsys.readouterr().out
+
+    def test_changed_body_updates_and_logs_newer(self, tmp_path: Path, monkeypatch, capsys):
+        url = "https://x/jazz.txt"
+        lists_dir = tmp_path / "lists"
+        meta_dir = tmp_path / "meta"
+        lists_dir.mkdir()
+        dest = lists_dir / ry.list_filename_for_url(url)
+        dest.write_text("https://youtu.be/old\n", encoding="utf-8")
+        ry.write_validators(meta_dir, url, etag='"v1"', last_modified=None)
+
+        def fake_get(u, **k):
+            assert k.get("headers", {}).get("If-None-Match") == '"v1"'
+            return _FakeResponse(b"https://youtu.be/new\n", headers={"ETag": '"v2"'})
+
+        monkeypatch.setattr(ry.requests, "get", fake_get)
+
+        assert ry.fetch_list_conditional(url, lists_dir, meta_dir) == "updated"
+        assert dest.read_text(encoding="utf-8").strip() == "https://youtu.be/new"
+        assert ry.read_validators(meta_dir, url) == {"etag": '"v2"'}
+        assert "remote newer than local cache" in capsys.readouterr().out
+
+    def test_identical_body_without_validators_is_unchanged(self, tmp_path: Path, monkeypatch, capsys):
+        # A server that sends no validators always returns a 200 body. If the
+        # bytes match the cache we must report "unchanged" and not claim "newer".
+        url = "https://x/jazz.txt"
+        lists_dir = tmp_path / "lists"
+        meta_dir = tmp_path / "meta"
+        lists_dir.mkdir()
+        dest = lists_dir / ry.list_filename_for_url(url)
+        dest.write_text("https://youtu.be/same\n", encoding="utf-8")
+
+        monkeypatch.setattr(
+            ry.requests, "get", lambda u, **k: _FakeResponse(b"https://youtu.be/same\n")
+        )
+
+        assert ry.fetch_list_conditional(url, lists_dir, meta_dir) == "unchanged"
+        assert "remote newer" not in capsys.readouterr().out
+
+    def test_network_error_with_cache_returns_cached(self, tmp_path: Path, monkeypatch):
+        url = "https://x/jazz.txt"
+        lists_dir = tmp_path / "lists"
+        meta_dir = tmp_path / "meta"
+        lists_dir.mkdir()
+        dest = lists_dir / ry.list_filename_for_url(url)
+        dest.write_text("https://youtu.be/cached\n", encoding="utf-8")
+
+        def boom(u, **k):
+            raise ry.requests.RequestException("connection refused")
+
+        monkeypatch.setattr(ry.requests, "get", boom)
+
+        assert ry.fetch_list_conditional(url, lists_dir, meta_dir) == "cached"
+        assert dest.read_text(encoding="utf-8").strip() == "https://youtu.be/cached"
+
+    def test_failure_without_cache_raises(self, tmp_path: Path, monkeypatch):
+        url = "https://x/jazz.txt"
+        monkeypatch.setattr(
+            ry.requests, "get", lambda u, **k: _FakeResponse(b"oops", status=404)
+        )
+        with pytest.raises(RuntimeError):
+            ry.fetch_list_conditional(url, tmp_path / "lists", tmp_path / "meta")
+
+    def test_empty_body_without_cache_raises(self, tmp_path: Path, monkeypatch):
+        url = "https://x/jazz.txt"
+        monkeypatch.setattr(ry.requests, "get", lambda u, **k: _FakeResponse(b""))
+        with pytest.raises(RuntimeError):
+            ry.fetch_list_conditional(url, tmp_path / "lists", tmp_path / "meta")
+
+
+# ---------------------------------------------------------------------------
+# refresh_lists_conditional
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshListsConditional:
+    def test_counts_updated_and_unchanged(self, tmp_path: Path, monkeypatch):
+        results = {"https://x/a.txt": "updated", "https://x/b.txt": "unchanged", "https://x/c.txt": "cached"}
+
+        def fake_fetch(url, dest_dir, meta_dir):
+            return results[url]
+
+        monkeypatch.setattr(ry, "fetch_list_conditional", fake_fetch)
+        updated, unchanged = ry.refresh_lists_conditional(
+            list(results.keys()), tmp_path / "lists", tmp_path / "meta"
+        )
+        assert updated == 1
+        assert unchanged == 2
+
+    def test_propagates_hard_failure(self, tmp_path: Path, monkeypatch):
+        def fake_fetch(url, dest_dir, meta_dir):
+            raise RuntimeError("no cache")
+
+        monkeypatch.setattr(ry, "fetch_list_conditional", fake_fetch)
+        with pytest.raises(RuntimeError):
+            ry.refresh_lists_conditional(["https://x/a.txt"], tmp_path / "lists", tmp_path / "meta")
 
 
 # ---------------------------------------------------------------------------
