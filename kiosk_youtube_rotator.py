@@ -17,16 +17,20 @@ Features:
 
 Two kinds of input file
 -----------------------
---config  : a ".conf" file listing REMOTE URL-list files to download, one URL
-            per line (blanks and "#" comments ignored). Each downloaded file is
-            a playlist in the "URL-list format" described below. These are
-            re-downloaded periodically (see --lists-refresh-interval) into a
-            local cache dir (default ./downloaded_lists) that survives restarts.
-            If a download fails but a cached copy exists, the cached copy is
-            used; if there is no cached copy and nothing else to play, the
-            program exits with an error.
---urls    : an OPTIONAL local playlist file in the same URL-list format. Its
-            links are merged with the links from the downloaded lists.
+--config  : a ".conf" file listing REMOTE URL-list files to keep fresh, one URL
+            per line (blanks and "#" comments ignored). Each remote file is a
+            playlist in the "URL-list format" described below. They are written
+            in place by their basename (".../music-jazz-list.txt" becomes
+            "music-jazz-list.txt") into --lists-dir (default: the working dir)
+            and re-downloaded periodically (see --lists-refresh-interval) only
+            when the remote copy is NEWER than the local one. A list the program
+            created in a previous run that is later dropped from --config is
+            deleted; files the program never created are never touched. --config
+            does NOT decide what plays.
+--urls    : REQUIRED. The single ACTIVE playlist file, in the URL-list format.
+            This one file is the entire rotation pool (no mixing across lists).
+            If its basename matches one of the --config lists it is also kept
+            fresh; otherwise it is simply played as-is.
 
 URL-list format
 ---------------
@@ -61,8 +65,9 @@ Semantics:
     Only the "200:" prefix here, so link4 is played at least 200 seconds longer
     than the standard random delay would dictate. No random start ("%s" absent).
 
-5)  The URL pool is re-read after EVERY video switch, so links can be added or
-    removed (locally, or remotely on the next refresh) without restarting.
+5)  The active --urls list is re-read after EVERY video switch, so links can be
+    added or removed (locally, or remotely on the next refresh) without
+    restarting.
 
 Dependencies
 ------------
@@ -821,6 +826,30 @@ def list_filename_for_url(url: str) -> str:
     return f"{digest}_{base}"
 
 
+def list_basename_for_url(url: str) -> str:
+    """Build a predictable, human-readable local filename for a remote list URL.
+
+    Unlike ``list_filename_for_url`` this keeps NO hash prefix: the file is named
+    purely after the URL's basename (sanitized, with a ".txt" suffix), so a
+    remote ``.../music-jazz-list.txt`` is written in place as
+    ``music-jazz-list.txt``. This is what the in-place refresher uses so the
+    active ``--urls`` file can simply point at that human path.
+
+    Because the hash is dropped, two ``--config`` URLs that share a basename map
+    to the same file and would clobber each other; the refresher warns about that
+    rather than silently losing one of them.
+    """
+    from urllib.parse import urlparse
+
+    path_part = urlparse(url).path
+    base = os.path.basename(path_part) or "list"
+    # Keep only conservative characters; replace anything else with "_".
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+    if not base.endswith(".txt"):
+        base += ".txt"
+    return base
+
+
 def fetch_list(url: str, dest_dir: Path) -> bool:
     """Download a single remote URL-list file into dest_dir.
 
@@ -972,26 +1001,28 @@ def write_validators(
         print(f"[WARN] Could not store validators for {url}: {exc}", file=sys.stderr)
 
 
-def fetch_list_conditional(url: str, dest_dir: Path, meta_dir: Path) -> str:
-    """Conditionally download a remote URL-list file.
+def _conditional_download(url: str, dest: Path, meta_dir: Path) -> str:
+    """Conditionally download ``url`` to the explicit file ``dest``.
 
-    Uses cached ETag / Last-Modified validators (when both a cached copy and a
-    sidecar exist) to send If-None-Match / If-Modified-Since, so the server can
-    answer "304 Not Modified" without resending the body. Only when the remote
-    copy is genuinely newer is the body downloaded, the cache atomically
-    replaced, and an ``[INFO]`` "remote newer" line logged.
+    Shared core behind both fetch_list_conditional() (which writes a hashed
+    cache file) and fetch_list_inplace() (which writes a human basename file).
+
+    Uses cached ETag / Last-Modified validators (when both ``dest`` and a sidecar
+    exist) to send If-None-Match / If-Modified-Since, so the server can answer
+    "304 Not Modified" without resending the body. Only when the remote copy is
+    genuinely newer is the body downloaded, ``dest`` atomically replaced, and an
+    ``[INFO]`` "remote newer" line logged.
 
     Returns one of:
-    - ``"updated"``   - a new body was downloaded and the cache replaced,
-    - ``"unchanged"`` - the remote copy matched the cache (304, or identical
-      bytes from a server that sends no validators); the cache is kept,
-    - ``"cached"``    - the download failed but a cached copy exists; kept.
+    - ``"updated"``   - a new body was downloaded and ``dest`` replaced,
+    - ``"unchanged"`` - the remote copy matched ``dest`` (304, or identical bytes
+      from a server that sends no validators); ``dest`` is kept,
+    - ``"cached"``    - the download failed but ``dest`` exists; kept.
 
-    Raises RuntimeError if the download fails AND no cached copy exists, matching
+    Raises RuntimeError if the download fails AND ``dest`` does not exist, matching
     fetch_list()'s contract.
     """
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / list_filename_for_url(url)
+    dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".part")
 
     had_cache = dest.exists()
@@ -1082,6 +1113,27 @@ def fetch_list_conditional(url: str, dest_dir: Path, meta_dir: Path) -> str:
     raise RuntimeError(f"Failed to download {url} and no cached copy exists.")
 
 
+def fetch_list_conditional(url: str, dest_dir: Path, meta_dir: Path) -> str:
+    """Conditionally download a remote list into the hashed cache in ``dest_dir``.
+
+    Thin wrapper over :func:`_conditional_download` that writes to the
+    collision-free ``dest_dir/list_filename_for_url(url)`` cache file. See the
+    core for the returned ``"updated"``/``"unchanged"``/``"cached"`` semantics.
+    """
+    return _conditional_download(url, dest_dir / list_filename_for_url(url), meta_dir)
+
+
+def fetch_list_inplace(url: str, base_dir: Path, meta_dir: Path) -> str:
+    """Conditionally download a remote list to its basename file in ``base_dir``.
+
+    Thin wrapper over :func:`_conditional_download` that writes to
+    ``base_dir/list_basename_for_url(url)`` (a human, hash-free path), so a
+    ``.../music-jazz-list.txt`` remote is refreshed in place as
+    ``base_dir/music-jazz-list.txt``. Same return semantics as the core.
+    """
+    return _conditional_download(url, base_dir / list_basename_for_url(url), meta_dir)
+
+
 def refresh_lists_conditional(
     list_urls: List[str],
     dest_dir: Path,
@@ -1103,6 +1155,134 @@ def refresh_lists_conditional(
             updated += 1
         else:
             unchanged += 1
+    return updated, unchanged
+
+
+# -------------------------
+# In-place refresh of the active lists referenced by --config
+# -------------------------
+#
+# The rotation loop plays exactly ONE list (the active --urls file). --config is
+# only there to keep the local list files fresh: each remote list is written in
+# place by its basename (so ".../music-jazz-list.txt" lands at
+# "music-jazz-list.txt") and only re-downloaded when the remote is newer.
+#
+# To make the requested cleanup safe, the program records which files it created
+# in a small "manifest" sidecar (kept in the validators/meta dir, away from the
+# working directory). Only files recorded there can be deleted when their URL is
+# dropped from --config, so a user's own files are never removed.
+
+
+def managed_manifest_path(meta_dir: Path) -> Path:
+    """Path of the JSON manifest of program-created in-place list files."""
+    return meta_dir / "managed_lists.json"
+
+
+def read_managed_manifest(meta_dir: Path) -> Dict[str, str]:
+    """Read the manifest mapping ``{file_path: url}``; ``{}`` if absent/corrupt.
+
+    A missing or unreadable manifest must never break a refresh; it only means we
+    have no proof of ownership, so nothing will be pruned (the safe default).
+    """
+    path = managed_manifest_path(meta_dir)
+    try:
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for key, val in data.items():
+        if isinstance(key, str) and isinstance(val, str):
+            out[key] = val
+    return out
+
+
+def write_managed_manifest(meta_dir: Path, mapping: Dict[str, str]) -> None:
+    """Persist the manifest of program-created list files (atomic, best-effort)."""
+    path = managed_manifest_path(meta_dir)
+    try:
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".part")
+        tmp.write_text(json.dumps(mapping), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception as exc:  # never let manifest caching break a refresh
+        print(f"[WARN] Could not store managed-lists manifest: {exc}", file=sys.stderr)
+
+
+def refresh_config_lists(
+    list_urls: List[str],
+    base_dir: Path,
+    meta_dir: Path,
+) -> Tuple[int, int]:
+    """Refresh every --config list in place and prune lists dropped from --config.
+
+    Each URL is downloaded (only when the remote is newer) to its basename file
+    in ``base_dir`` via :func:`fetch_list_inplace`. Returns a
+    ``(updated, unchanged)`` tuple with how many lists were freshly downloaded
+    versus left as-is.
+
+    Cleanup: any file recorded in a previous run's manifest whose URL is no
+    longer in ``list_urls`` is deleted (along with its validator sidecar). Only
+    manifest-recorded files are ever removed, so files the program never created
+    are left untouched.
+
+    A failure on any single list is fatal only when that list has no local copy
+    (fetch_list_inplace raises); otherwise the local copy is kept.
+    """
+    # Warn about basename collisions: without the hash prefix, two --config URLs
+    # sharing a basename map to the same file and would clobber each other.
+    seen: Dict[str, str] = {}
+    for url in list_urls:
+        base = list_basename_for_url(url)
+        if base in seen and seen[base] != url:
+            print(
+                f"[WARN] --config lists '{seen[base]}' and '{url}' share basename "
+                f"'{base}'; they will overwrite the same in-place file.",
+                file=sys.stderr,
+            )
+        else:
+            seen[base] = url
+
+    current_urls = set(list_urls)
+
+    # Prune lists that we created previously but that are no longer requested.
+    previous = read_managed_manifest(meta_dir)
+    for file_path_str, url in previous.items():
+        if url in current_urls:
+            continue
+        file_path = Path(file_path_str)
+        try:
+            if file_path.exists():
+                file_path.unlink()
+                print(
+                    f"[INFO] Removed stale list {file_path} (no longer in --config)."
+                )
+        except Exception as exc:
+            print(f"[WARN] Could not remove stale list {file_path}: {exc}", file=sys.stderr)
+        # Drop the now-orphaned validator sidecar too (best-effort).
+        try:
+            sidecar = validators_path_for_url(meta_dir, url)
+            if sidecar.exists():
+                sidecar.unlink()
+        except Exception:
+            pass
+
+    updated = 0
+    unchanged = 0
+    manifest: Dict[str, str] = {}
+    for url in list_urls:
+        dest = base_dir / list_basename_for_url(url)
+        # Record ownership before fetching so even a kept-cache file is tracked.
+        manifest[str(dest)] = url
+        if fetch_list_inplace(url, base_dir, meta_dir) == "updated":
+            updated += 1
+        else:
+            unchanged += 1
+
+    write_managed_manifest(meta_dir, manifest)
     return updated, unchanged
 
 
@@ -1152,19 +1332,22 @@ def main() -> None:
         "--config",
         required=True,
         help=(
-            "Path to a .conf file listing remote URL-list files to download "
+            "Path to a .conf file listing remote URL-list files to keep fresh "
             "(one URL per line, e.g. raw.githubusercontent.com/.../jazz.txt). "
-            "These are re-downloaded periodically in the background."
+            "Each list is downloaded in place by its basename and re-downloaded "
+            "in the background only when the remote copy is newer. --config does "
+            "NOT decide what plays; that is the single --urls list."
         ),
     )
     parser.add_argument(
         "--urls",
         type=str,
-        default=None,
+        required=True,
         help=(
-            "Optional path to a LOCAL text file with YouTube URLs (one per "
-            "line, with optional prefixes/suffixes). Its links are added to "
-            "those from the downloaded lists."
+            "Path to the ACTIVE playlist file to play (one YouTube URL per line, "
+            "with optional prefixes/suffixes). This single file is the rotation "
+            "pool. If its basename matches one of the --config lists it is also "
+            "kept fresh; otherwise it is played as-is."
         ),
     )
     parser.add_argument(
@@ -1181,8 +1364,9 @@ def main() -> None:
         type=str,
         default=None,
         help=(
-            "Directory for cached downloaded lists "
-            f"(default: ./{DEFAULT_LISTS_DIR_NAME})."
+            "Directory where --config lists are written in place by basename "
+            "(default: the current working directory). Point --urls at a file in "
+            "this directory to have the active list kept fresh automatically."
         ),
     )
     parser.add_argument(
@@ -1289,9 +1473,12 @@ def main() -> None:
 
     config_path = Path(args.config)
     base_dir = Path.cwd()
-    lists_dir = Path(args.lists_dir) if args.lists_dir else base_dir / DEFAULT_LISTS_DIR_NAME
+    # --config lists are refreshed in place by basename into this directory; the
+    # active --urls file usually lives here too. Defaults to the working dir.
+    lists_dir = Path(args.lists_dir) if args.lists_dir else base_dir
     validators_dir = Path(args.validators_dir) if args.validators_dir else default_validators_dir()
-    extra_urls_path = Path(args.urls) if args.urls else None
+    # The single ACTIVE playlist (--urls is required): the only thing played.
+    extra_urls_path = Path(args.urls)
 
     # Read the list of remote URL-list files to keep in sync.
     try:
@@ -1300,32 +1487,31 @@ def main() -> None:
         print(f"[ERROR] Failed to read --config '{config_path}': {exc}", file=sys.stderr)
         sys.exit(1)
 
-    # Per the design: start immediately and only refresh in the background.
-    # We still attempt one download up front so a first-ever run has content,
-    # but we tolerate failures here as long as *some* usable URLs exist (either
-    # from a previous cache or from --urls). A hard failure is raised by
-    # load_all_urls() below only if the pool ends up empty.
+    # Refresh the --config lists in place up front (only pulling bodies that are
+    # newer) so the active list is current before the first video. Failures are
+    # tolerated as long as the --urls file is readable; load_urls() below is the
+    # hard gate.
     try:
-        refresh_lists_conditional(list_urls, lists_dir, validators_dir)
+        refresh_config_lists(list_urls, lists_dir, validators_dir)
     except Exception as exc:
-        print(f"[WARN] Initial list download incomplete: {exc}", file=sys.stderr)
+        print(f"[WARN] Initial list refresh incomplete: {exc}", file=sys.stderr)
 
-    # Build the initial URL pool (downloaded lists + optional --urls file).
+    # The rotation pool is ONLY the active --urls list (no mixing across lists).
     try:
-        urls: List[URLConfig] = load_all_urls(lists_dir, extra_urls_path)
+        urls: List[URLConfig] = load_urls(extra_urls_path)
     except Exception as exc:
-        print(f"[ERROR] {exc}", file=sys.stderr)
+        print(f"[ERROR] Could not load --urls '{extra_urls_path}': {exc}", file=sys.stderr)
         sys.exit(1)
 
-    # Background thread: periodically re-download the lists. It only refreshes
-    # the cached files on disk; the main loop re-reads them via load_all_urls()
-    # on every switch, so no shared in-memory state needs locking.
+    # Background thread: periodically refresh the --config lists in place. It only
+    # rewrites files on disk; the main loop re-reads the active --urls file on
+    # every switch, so no shared in-memory state needs locking.
     stop_event = threading.Event()
 
     def lists_refresher() -> None:
         while not stop_event.wait(args.lists_refresh_interval):
             try:
-                updated, unchanged = refresh_lists_conditional(
+                updated, unchanged = refresh_config_lists(
                     list_urls, lists_dir, validators_dir
                 )
                 print(
@@ -1480,15 +1666,13 @@ def main() -> None:
                 print(f"[INFO] Waiting {delay} seconds before preloading next URL...")
             time.sleep(delay)
 
-            # Re-read the URL pool so changes are picked up without restarting.
-            # The cached list files on disk are kept current by the background
-            # refresher thread; here we just re-read whatever is on disk plus
-            # the optional --urls file.
+            # Re-read the active --urls list so edits (local, or pulled in place
+            # by the background refresher) are picked up without restarting.
             try:
-                urls = load_all_urls(lists_dir, extra_urls_path)
+                urls = load_urls(extra_urls_path)
             except Exception as exc:
                 print(
-                    f"[WARN] Could not reload URL pool: {exc}. "
+                    f"[WARN] Could not reload --urls '{extra_urls_path}': {exc}. "
                     f"Using previously loaded URLs.",
                     file=sys.stderr,
                 )

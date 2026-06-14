@@ -713,6 +713,183 @@ class TestRefreshListsConditional:
 
 
 # ---------------------------------------------------------------------------
+# list_basename_for_url
+# ---------------------------------------------------------------------------
+
+
+class TestListBasenameForUrl:
+    def test_keeps_basename_without_hash(self):
+        name = ry.list_basename_for_url(
+            "https://raw.githubusercontent.com/u/r/main/music-jazz-list.txt"
+        )
+        assert name == "music-jazz-list.txt"
+
+    def test_same_basename_different_url_collides(self):
+        # Without a hash prefix, two different URLs that share a basename map to
+        # the same file (the refresher warns about this).
+        a = ry.list_basename_for_url("https://example.com/one/list.txt")
+        b = ry.list_basename_for_url("https://example.com/two/list.txt")
+        assert a == b == "list.txt"
+
+    def test_appends_txt_when_missing(self):
+        assert ry.list_basename_for_url("https://example.com/playlist") == "playlist.txt"
+
+    def test_sanitizes_unsafe_characters(self):
+        name = ry.list_basename_for_url("https://example.com/a b?c=1.txt")
+        assert " " not in name and "?" not in name and "=" not in name
+
+
+# ---------------------------------------------------------------------------
+# fetch_list_inplace  (requests.get mocked)
+# ---------------------------------------------------------------------------
+
+
+class TestFetchListInplace:
+    def test_initial_download_writes_basename_file(self, tmp_path: Path, monkeypatch, capsys):
+        url = "https://x/music-jazz-list.txt"
+        base_dir = tmp_path / "lists"
+        meta_dir = tmp_path / "meta"
+        dest = base_dir / "music-jazz-list.txt"
+
+        monkeypatch.setattr(
+            ry.requests,
+            "get",
+            lambda u, **k: _FakeResponse(b"https://youtu.be/abc\n", headers={"ETag": '"v1"'}),
+        )
+
+        assert ry.fetch_list_inplace(url, base_dir, meta_dir) == "updated"
+        # File is written under its human basename, no hash prefix.
+        assert dest.read_text(encoding="utf-8").strip() == "https://youtu.be/abc"
+        assert "(initial)" in capsys.readouterr().out
+
+    def test_not_modified_keeps_file(self, tmp_path: Path, monkeypatch):
+        url = "https://x/music-jazz-list.txt"
+        base_dir = tmp_path / "lists"
+        meta_dir = tmp_path / "meta"
+        base_dir.mkdir()
+        dest = base_dir / "music-jazz-list.txt"
+        dest.write_text("https://youtu.be/cached\n", encoding="utf-8")
+        ry.write_validators(meta_dir, url, etag='"v1"', last_modified=None)
+
+        def fake_get(u, **k):
+            assert k.get("headers", {}).get("If-None-Match") == '"v1"'
+            return _FakeResponse(b"", status=304)
+
+        monkeypatch.setattr(ry.requests, "get", fake_get)
+
+        assert ry.fetch_list_inplace(url, base_dir, meta_dir) == "unchanged"
+        assert dest.read_text(encoding="utf-8").strip() == "https://youtu.be/cached"
+
+    def test_changed_body_updates_and_logs_newer(self, tmp_path: Path, monkeypatch, capsys):
+        url = "https://x/music-jazz-list.txt"
+        base_dir = tmp_path / "lists"
+        meta_dir = tmp_path / "meta"
+        base_dir.mkdir()
+        dest = base_dir / "music-jazz-list.txt"
+        dest.write_text("https://youtu.be/old\n", encoding="utf-8")
+        ry.write_validators(meta_dir, url, etag='"v1"', last_modified=None)
+
+        monkeypatch.setattr(
+            ry.requests,
+            "get",
+            lambda u, **k: _FakeResponse(b"https://youtu.be/new\n", headers={"ETag": '"v2"'}),
+        )
+
+        assert ry.fetch_list_inplace(url, base_dir, meta_dir) == "updated"
+        assert dest.read_text(encoding="utf-8").strip() == "https://youtu.be/new"
+        assert "remote newer than local cache" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# managed-lists manifest
+# ---------------------------------------------------------------------------
+
+
+class TestManagedManifest:
+    def test_round_trip(self, tmp_path: Path):
+        mapping = {"/lists/jazz.txt": "https://x/jazz.txt"}
+        ry.write_managed_manifest(tmp_path, mapping)
+        assert ry.read_managed_manifest(tmp_path) == mapping
+
+    def test_missing_returns_empty(self, tmp_path: Path):
+        assert ry.read_managed_manifest(tmp_path) == {}
+
+    def test_corrupt_returns_empty(self, tmp_path: Path):
+        ry.managed_manifest_path(tmp_path).write_text("{not json", encoding="utf-8")
+        assert ry.read_managed_manifest(tmp_path) == {}
+
+
+# ---------------------------------------------------------------------------
+# refresh_config_lists
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshConfigLists:
+    def test_counts_updated_and_unchanged(self, tmp_path: Path, monkeypatch):
+        results = {"https://x/a.txt": "updated", "https://x/b.txt": "unchanged"}
+
+        def fake_fetch(url, base_dir, meta_dir):
+            return results[url]
+
+        monkeypatch.setattr(ry, "fetch_list_inplace", fake_fetch)
+        updated, unchanged = ry.refresh_config_lists(
+            list(results.keys()), tmp_path / "lists", tmp_path / "meta"
+        )
+        assert (updated, unchanged) == (1, 1)
+
+    def test_writes_manifest_of_managed_files(self, tmp_path: Path, monkeypatch):
+        base_dir = tmp_path / "lists"
+        meta_dir = tmp_path / "meta"
+        monkeypatch.setattr(ry, "fetch_list_inplace", lambda u, b, m: "updated")
+
+        ry.refresh_config_lists(["https://x/jazz.txt"], base_dir, meta_dir)
+        manifest = ry.read_managed_manifest(meta_dir)
+        assert manifest == {str(base_dir / "jazz.txt"): "https://x/jazz.txt"}
+
+    def test_deletes_program_created_file_dropped_from_config(self, tmp_path: Path, monkeypatch):
+        base_dir = tmp_path / "lists"
+        meta_dir = tmp_path / "meta"
+        base_dir.mkdir()
+        monkeypatch.setattr(ry, "fetch_list_inplace", lambda u, b, m: "unchanged")
+
+        # First run manages both lists; second run drops cams from --config.
+        ry.refresh_config_lists(
+            ["https://x/jazz.txt", "https://x/cams.txt"], base_dir, meta_dir
+        )
+        cams = base_dir / "cams.txt"
+        cams.write_text("https://youtu.be/cam\n", encoding="utf-8")
+
+        ry.refresh_config_lists(["https://x/jazz.txt"], base_dir, meta_dir)
+
+        # The dropped, program-created list is gone and off the manifest.
+        assert not cams.exists()
+        assert str(cams) not in ry.read_managed_manifest(meta_dir)
+
+    def test_does_not_delete_files_it_never_created(self, tmp_path: Path, monkeypatch):
+        base_dir = tmp_path / "lists"
+        meta_dir = tmp_path / "meta"
+        base_dir.mkdir()
+        monkeypatch.setattr(ry, "fetch_list_inplace", lambda u, b, m: "unchanged")
+
+        # A user's own file that the program never recorded in any manifest.
+        user_file = base_dir / "my-own.txt"
+        user_file.write_text("https://youtu.be/mine\n", encoding="utf-8")
+
+        ry.refresh_config_lists(["https://x/jazz.txt"], base_dir, meta_dir)
+
+        assert user_file.exists()
+
+    def test_warns_on_duplicate_basename(self, tmp_path: Path, monkeypatch, capsys):
+        monkeypatch.setattr(ry, "fetch_list_inplace", lambda u, b, m: "unchanged")
+        ry.refresh_config_lists(
+            ["https://a.com/list.txt", "https://b.com/list.txt"],
+            tmp_path / "lists",
+            tmp_path / "meta",
+        )
+        assert "share basename" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
 # load_all_urls
 # ---------------------------------------------------------------------------
 

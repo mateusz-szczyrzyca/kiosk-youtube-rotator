@@ -2,11 +2,11 @@
 
 A tiny, unattended **YouTube rotator** for a TV or any spare screen.
 
-You give it one or more playlists of YouTube links. Every so often it picks a
-**random** link, opens it in a fullscreen, CDP-controlled Chrome window, and
-lets it play. After a random amount of time it picks another link, loads it in
-the background, and swaps it in — closing the old window and bringing the new
-video forward. Then it repeats, forever.
+You give it **one active playlist** of YouTube links (`--urls`). Every so often
+it picks a **random** link from that list, opens it in a fullscreen,
+CDP-controlled Chrome window, and lets it play. After a random amount of time it
+picks another link, loads it in the background, and swaps it in — closing the
+old window and bringing the new video forward. Then it repeats, forever.
 
 The result is a screen that just *plays something*, hands-free. No remote, no
 playlist babysitting, no "the stream ended an hour ago and now it's just a black
@@ -14,10 +14,12 @@ screen." If a link happens to be dead (a webcam that got taken offline, say),
 that's fine — nothing plays for a while, and the next rotation quietly replaces
 it.
 
-The playlists themselves are **downloaded from remote URLs** (e.g. raw GitHub
-files) and refreshed periodically in the background, so you can edit them
-remotely without restarting — and without depending on git being installed on
-the kiosk box.
+The list you play can itself be **kept fresh from a remote URL** (e.g. a raw
+GitHub file): a background thread re-downloads the `--config` lists in place
+whenever the remote copy is newer, so you can edit them remotely without
+restarting — and without depending on git being installed on the kiosk box.
+Only the single `--urls` list is ever played, so different genres never get
+mixed together.
 
 ## Why
 
@@ -32,19 +34,23 @@ will change and "something new" will come on.
 
 ## How it works
 
-- Reads a **`--config` file** that lists *remote playlist URLs* (one per line).
-- A **background thread** refreshes each playlist every few minutes (default 5;
-  see `--lists-refresh-interval`) into a local cache directory
-  (`./downloaded_lists`) that survives restarts. The refresh uses **HTTP
-  conditional requests** (`ETag` / `Last-Modified`), so a playlist is only
-  re-downloaded when the remote copy is actually **newer** — and when that
-  happens it's logged, e.g.
+- Plays exactly **one active list**, the **`--urls` file** (required). The
+  rotation loop draws random links from that single list — nothing else is mixed
+  in.
+- Reads a **`--config` file** that lists *remote playlist URLs* (one per line)
+  to keep fresh. A **background thread** re-downloads each one every few minutes
+  (default 5; see `--lists-refresh-interval`), writing it **in place by its
+  basename** (e.g. `music-jazz-list.txt`) into `--lists-dir` (default: the
+  working directory). The refresh uses **HTTP conditional requests** (`ETag` /
+  `Last-Modified`), so a list is only re-downloaded when the remote copy is
+  actually **newer** — and when that happens it's logged, e.g.
   `[INFO] https://.../cams.txt: remote newer than local cache; updated ...`.
-  The validators it remembers between checks are cached in a per-system temp
-  directory (see `--validators-dir`); losing them only costs one extra full
-  download.
-- The rotation loop draws random links from the **combined pool** of all cached
-  playlists plus an optional **local `--urls` file**.
+  The validators it remembers between checks live in a per-system temp directory
+  (see `--validators-dir`); losing them only costs one extra full download.
+- If your `--urls` file is one of the `--config` lists (same basename), it is
+  kept fresh automatically. If it isn't, it's simply played as-is.
+- A list the program downloaded in a previous run that you later remove from
+  `--config` is **deleted**; files the program never created are never touched.
 - Launches Chrome in kiosk mode with the **Chrome DevTools Protocol (CDP)**
   enabled on a local debugging port. Control happens over a CDP websocket
   rather than fragile OS-level key presses.
@@ -53,20 +59,21 @@ will change and "something new" will come on.
 - For each switch it **preloads the next link in a hidden background window**
   first; only once that window is ready does it close the current one and
   promote the new window. This avoids flashing an empty window during the swap.
-- The URL pool is **re-read on every switch**, so remote edits (picked up on the
-  next refresh) and local `--urls` edits take effect without a restart.
+- The active `--urls` list is **re-read on every switch**, so remote edits
+  (picked up on the next refresh) and local edits take effect without a restart.
 
 ### Resilience
 
-- If a playlist **download fails but a cached copy exists**, the cached copy is
-  used and a warning is logged.
-- If a playlist has **no cached copy and cannot be downloaded**, and there are
-  no other usable links, the program exits with an error rather than spinning on
-  an empty pool.
+- If a list **download fails but a local copy exists**, the local copy is kept
+  and a warning is logged.
+- If the **`--urls` file cannot be read** (missing/empty) at startup, the
+  program exits with an error rather than spinning on an empty pool.
 - Refreshes are **conditional**: when the remote copy is unchanged the server
-  replies `304 Not Modified` and the cached copy is kept untouched. Servers that
+  replies `304 Not Modified` and the local copy is kept untouched. Servers that
   send no validators are handled too — the freshly downloaded bytes are compared
-  against the cache, so an identical body is never re-announced as "newer".
+  against the local file, so an identical body is never re-announced as "newer".
+- Stale-list cleanup only ever deletes files the program itself created (tracked
+  in a metadata manifest), so your own local files are never removed.
 
 > **Platform:** Chrome control is built around Windows (process handling,
 > `tasklist`/`taskkill`, the default profile path). The parsing, downloading and
@@ -91,7 +98,7 @@ installed on the kiosk box.
 ## Quick start
 
 1. Create a `--config` file, e.g. `lists-urls.conf`, with one remote playlist
-   URL per line:
+   URL per line (these are kept fresh, but only the `--urls` one plays):
 
    ```text
    # remote playlists (raw GitHub links work well)
@@ -99,11 +106,15 @@ installed on the kiosk box.
    https://raw.githubusercontent.com/<you>/<repo>/main/live-cams-wildfire.txt
    ```
 
-2. Run:
+2. Run, choosing the single list you want to play with `--urls`:
 
    ```bash
-   python kiosk_youtube_rotator.py --config lists-urls.conf --player-fullscreen --mute
+   python kiosk_youtube_rotator.py --config lists-urls.conf --urls music-jazz-list.txt --player-fullscreen --mute
    ```
+
+   Because `music-jazz-list.txt` is also one of the `--config` lists, it's kept
+   fresh in place while it plays. Want cams instead? Just point `--urls` at
+   `live-cams-wildfire.txt` — the two never get mixed.
 
 3. Press `Ctrl+C` to stop. The script stops the background refresher, closes the
    windows it opened, and terminates the Chrome instance it started.
@@ -111,28 +122,23 @@ installed on the kiosk box.
 `--mute` is recommended for reliable autoplay; drop it if you want sound (handy
 for the jazz list, less so for wildlife cams).
 
-To mix in some local-only links without publishing them, add a `--urls` file:
-
-```bash
-python kiosk_youtube_rotator.py --config lists-urls.conf --urls local-extras.txt --mute
-```
-
 ## Input files
 
 There are **two kinds** of input file, with two different formats.
 
-### 1. The `--config` file (remote playlist list)
+### 1. The `--config` file (remote lists to keep fresh)
 
 One **playlist URL** per line. Blank lines and lines starting with `#` are
-ignored. Each URL must point to a file in the *playlist format* below. Example:
+ignored. Each URL must point to a file in the *playlist format* below, and is
+written in place by its basename (e.g. `music-jazz-list.txt`). Example:
 
 ```text
-# downloaded and refreshed every few minutes
+# kept fresh in the background; whichever one --urls names is what plays
 https://raw.githubusercontent.com/<you>/<repo>/main/music-jazz-list.txt
 https://raw.githubusercontent.com/<you>/<repo>/main/live-cams-wildfire.txt
 ```
 
-### 2. Playlist files (`--urls`, and each downloaded list)
+### 2. Playlist files (`--urls`, the active list, and each downloaded list)
 
 One **video link** per line. Blank lines and lines starting with `#` are
 ignored.
@@ -168,10 +174,10 @@ https://www.youtube.com/watch?v=ygedg03NpUQ
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--config PATH` | *(required)* | File listing remote playlist URLs to download (one per line). |
-| `--urls PATH` | none | Optional local playlist file; its links are merged into the pool. |
-| `--lists-refresh-interval SEC` | `300` | How often to re-download the playlists in the background. |
-| `--lists-dir PATH` | `./downloaded_lists` | Where to cache downloaded playlists. |
+| `--config PATH` | *(required)* | File listing remote list URLs to keep fresh (one per line). Does not decide what plays. |
+| `--urls PATH` | *(required)* | The single ACTIVE playlist file that is played. Kept fresh automatically if its basename matches a `--config` list. |
+| `--lists-refresh-interval SEC` | `300` | How often to re-download the `--config` lists in the background. |
+| `--lists-dir PATH` | working dir | Directory where `--config` lists are written in place by basename. |
 | `--validators-dir PATH` | per-system temp dir | Where to cache HTTP conditional-request validators (ETag/Last-Modified) so lists are only re-downloaded when the remote is newer. |
 | `--min-delay SEC` | `120` | Minimum delay between switches. |
 | `--max-delay SEC` | `600` | Maximum delay between switches. |
