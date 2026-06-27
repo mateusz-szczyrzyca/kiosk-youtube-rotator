@@ -14,7 +14,7 @@ https://www.youtube.com/watch?v=qwvk5hbEJnY
 # Red Squirrel Studio (3 next as well)
 https://www.youtube.com/watch?v=dJVVcv9-ndg
 https://youtu.be/uCad6RTDw0g?t=%s:34346
-https://youtu.be/FkLqHHRBDWU?t=22558
+https://youtu.be/FkLqHHRBDWU?t=%s:22558
 https://www.youtube.com/watch?v=ZVRUiKmCs84
 https://www.youtube.com/watch?v=ZWhvO6R37ck
 https://www.youtube.com/watch?v=2EZavJUNdLI
@@ -51,3 +51,7 @@ https://www.youtube.com/watch?v=RnCAl0mQgqA
 https://www.youtube.com/watch?v=DsNtwGJXTTs
 https://www.youtube.com/watch?v=pZZst4BOpVI
 https://www.youtube.com/watch?v=xXZqU5vnEug
+https://www.youtube.com/watch?v=-rXriX4SiQk
+https://www.youtube.com/watch?v=BaEFc79IMCA
+https://www.youtube.com/watch?v=qpukdDslCjk
+https://www.youtube.com/watch?v=BmOLK7LTKbY
