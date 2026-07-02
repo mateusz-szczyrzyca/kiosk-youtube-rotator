@@ -447,8 +447,24 @@ class ChromeController:
         return window_id
 
     def set_window_state(self, window_id: int, state: str) -> None:
-        """Set window state: 'normal', 'minimized', 'maximized', 'fullscreen'."""
+        """Set window state: 'normal', 'minimized', 'maximized', 'fullscreen'.
+
+        On macOS, Chrome refuses to move a window directly from the native
+        'fullscreen' state (which YouTube's player fullscreen triggers) into
+        'minimized'/'maximized' and errors with "restore it to normal state
+        first". To make this reliable and cross-platform, restore the window to
+        'normal' before applying any non-normal target state; the extra step is
+        a harmless no-op on Windows/Linux where fullscreen isn't involved.
+        """
         try:
+            if state != "normal":
+                self.browser_conn.call(
+                    "Browser.setWindowBounds",
+                    {"windowId": window_id, "bounds": {"windowState": "normal"}},
+                )
+                # Give macOS's fullscreen-exit animation a moment to settle so
+                # the follow-up state change isn't rejected mid-transition.
+                time.sleep(0.3)
             self.browser_conn.call(
                 "Browser.setWindowBounds",
                 {"windowId": window_id, "bounds": {"windowState": state}},
