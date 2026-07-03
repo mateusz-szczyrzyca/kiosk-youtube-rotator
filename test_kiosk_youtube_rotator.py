@@ -941,3 +941,110 @@ class TestLoadAllUrls:
         urls = ry.load_all_urls(lists_dir, None)
         assert [u.template for u in urls] == ["https://youtu.be/ok"]
 
+
+# ---------------------------------------------------------------------------
+# ChromeController.seek_player_to_live
+# ---------------------------------------------------------------------------
+#
+# seek_player_to_live() belongs to the CDP/browser layer, but unlike the rest
+# of ChromeController it never touches the websocket itself -- it only calls
+# mw.page_conn.call(...). That lets us unit-test its *contract* by injecting a
+# fake connection and asserting on the CDP request it emits, without a live
+# browser. These tests are deliberately strict about the in-page JS because the
+# whole point of the feature is that it must (a) only ever act on genuine
+# livestreams and (b) never disturb %s random-start VODs -- a future refactor
+# that loosens the detection should fail here loudly.
+
+
+class _RecordingConn:
+    """Stand-in for CDPConnection that records .call() invocations.
+
+    It performs no I/O. Pass ``raise_exc`` to simulate a CDP/websocket failure
+    so we can prove seek_player_to_live() treats such errors as non-fatal.
+    """
+
+    def __init__(self, raise_exc: Exception | None = None) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self._raise_exc = raise_exc
+
+    def call(self, method: str, params: dict | None = None, timeout: float = 10.0):
+        self.calls.append((method, params or {}))
+        if self._raise_exc is not None:
+            raise self._raise_exc
+        return {}
+
+
+def _run_seek_to_live(conn: _RecordingConn) -> None:
+    """Invoke seek_player_to_live with a fake connection.
+
+    ChromeController.__init__ dials a live browser, so we bypass it with
+    object.__new__ -- seek_player_to_live only needs the ManagedWindow's
+    page_conn, not any connected state on the controller.
+    """
+    controller = object.__new__(ry.ChromeController)
+    mw = ry.ManagedWindow(
+        target_id="t-1",
+        window_id=1,
+        page_ws_url="ws://127.0.0.1:9222/devtools/page/t-1",
+        page_conn=conn,  # type: ignore[arg-type]
+    )
+    controller.seek_player_to_live(mw)
+
+
+class TestSeekPlayerToLive:
+    def test_emits_single_runtime_evaluate(self):
+        conn = _RecordingConn()
+        _run_seek_to_live(conn)
+        # Exactly one CDP round-trip, and it must be a JS evaluation.
+        assert len(conn.calls) == 1
+        method, _params = conn.calls[0]
+        assert method == "Runtime.evaluate"
+
+    def test_evaluate_uses_by_value_and_no_await(self):
+        conn = _RecordingConn()
+        _run_seek_to_live(conn)
+        _method, params = conn.calls[0]
+        # returnByValue keeps the result serialisable; the seek must not block
+        # on a promise (there is none to await).
+        assert params.get("returnByValue") is True
+        assert params.get("awaitPromise") is False
+        assert isinstance(params.get("expression"), str)
+
+    def test_detection_is_strictly_infinite_duration(self):
+        # Regression guard for the core invariant: live detection keys off the
+        # infinite-duration signal, NOT the .ytp-live CSS class (which can
+        # linger on past-stream VODs and would wrongly hijack a %s start).
+        conn = _RecordingConn()
+        _run_seek_to_live(conn)
+        expr = conn.calls[0][1]["expression"]
+        assert "Infinity" in expr
+        assert "duration" in expr
+        # The bare ".ytp-live" class must not be used as a detection gate; only
+        # the ".ytp-live-badge" button is referenced (for the click-to-live).
+        assert "'.ytp-live'" not in expr
+        assert '".ytp-live"' not in expr
+
+    def test_seeks_to_live_head_via_badge_and_seekable_fallback(self):
+        conn = _RecordingConn()
+        _run_seek_to_live(conn)
+        expr = conn.calls[0][1]["expression"]
+        # Primary path: click the LIVE badge to jump to the live head.
+        assert ".ytp-live-badge" in expr
+        # Fallback path: hard-seek to the end of the seekable range.
+        assert "seekable" in expr
+        assert "currentTime" in expr
+
+    def test_cdp_failure_is_non_fatal(self):
+        # A failing CDP call must never bubble up and break the rotation loop.
+        conn = _RecordingConn(raise_exc=RuntimeError("ws boom"))
+        _run_seek_to_live(conn)  # should not raise
+        # The attempt was still made before the error was swallowed.
+        assert len(conn.calls) == 1
+
+    def test_timeout_error_is_also_swallowed(self):
+        # Any exception type from the CDP layer (not just RuntimeError) is
+        # non-fatal -- the loop keeps rotating regardless.
+        conn = _RecordingConn(raise_exc=TimeoutError("no response"))
+        _run_seek_to_live(conn)  # should not raise
+        assert len(conn.calls) == 1
+

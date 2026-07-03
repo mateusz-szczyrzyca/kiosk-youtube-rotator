@@ -122,6 +122,13 @@ installed on the kiosk box.
 `--mute` is recommended for reliable autoplay; drop it if you want sound (handy
 for the jazz list, less so for wildlife cams).
 
+By default the rotator forces **livestreams** to the live head each time they
+come to the foreground, so a live cam never lingers on a buffered/old DVR
+position (YouTube can otherwise resume a stream minutes — or a day — behind
+live). This only affects genuine livestreams; regular videos, including `%s`
+random-start links, keep their chosen start position. Pass `--no-force-live` to
+turn it off and allow normal DVR behavior.
+
 ## Input files
 
 There are **two kinds** of input file, with two different formats.
@@ -185,6 +192,7 @@ https://www.youtube.com/watch?v=ygedg03NpUQ
 | `--chrome PATH` | auto | Path to `chrome.exe`. Common locations and `PATH` are tried if omitted. |
 | `--remote-port N` | `9222` | Chrome remote-debugging port. |
 | `--player-fullscreen` | off | Toggle the YouTube player to fullscreen. |
+| `--force-live` / `--no-force-live` | on | For livestreams, seek to the live head instead of a buffered/resumed position. No-op for regular videos (including `%s` random-start links). |
 | `--mute` | off | Keep the video muted (recommended for autoplay). |
 | `--profile-dir PATH` | `./chrome_profile` | User-data-dir for the private profile. Ignored with `--use-default-profile`. |
 | `--use-default-profile` | off | Use your normal Chrome profile (stay logged in). Close Chrome first or use `--force-close-chrome`. |

@@ -651,6 +651,56 @@ class ChromeController:
         except Exception:
             pass
 
+    def seek_player_to_live(self, mw: ManagedWindow) -> None:
+        """
+        Best-effort: if the foreground video is a *livestream*, jump it to the
+        live head instead of wherever YouTube resumed it (DVR buffer / a
+        remembered position in the persistent Chrome profile).
+
+        This is kept separate from ``try_autoplay_and_fullscreen_player`` on
+        purpose: it must only ever run on true livestreams, and only once a
+        window is in the foreground (seeking during background preload would
+        just drift behind live again before the swap).
+
+        The live detection is intentionally strict: only genuine livestreams
+        report ``video.duration === Infinity``. Regular VODs -- including
+        ``%s`` random-start links and finished/past livestreams that are now
+        recordings -- have a finite duration, so their start position is left
+        completely untouched.
+        """
+
+        # NOTE: %% is escaped for Python's %-formatting even though we don't
+        # interpolate here; keep the JS free of stray % to avoid surprises.
+        js_seek_live = """
+        (function(){
+            const v = document.querySelector('video');
+            if (!v) return 'no-video';
+            // STRICT live detection: only true livestreams report an infinite
+            // duration. We deliberately do NOT rely on the .ytp-live CSS class,
+            // which can linger on past-stream VODs and hijack a %s start.
+            if (v.duration !== Infinity) return 'not-live';
+            // Clicking the LIVE badge seeks to the live head; no-ops at head.
+            const badge = document.querySelector('.ytp-live-badge');
+            if (badge) { try { badge.click(); } catch(e){} }
+            // Fallback: hard-seek to the end of the seekable range.
+            try {
+                if (v.seekable && v.seekable.length) {
+                    v.currentTime = v.seekable.end(v.seekable.length - 1);
+                }
+            } catch(e){}
+            return 'sought-live';
+        })();
+        """
+
+        try:
+            mw.page_conn.call(
+                "Runtime.evaluate",
+                {"expression": js_seek_live, "awaitPromise": False, "returnByValue": True},
+            )
+        except Exception:
+            # non-fatal: never let a failed live-seek break the rotation loop
+            pass
+
 
 # -------------------------
 # Helpers for URLs & config
@@ -1467,6 +1517,16 @@ def main() -> None:
         action="store_true",
         help="Toggle the YouTube player to fullscreen (not OS fullscreen).",
     )
+    parser.add_argument(
+        "--force-live",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If the video is a livestream, seek to the live head instead of a "
+            "buffered/resumed position. No-op for regular videos (including %%s "
+            "random-start links). Use --no-force-live to disable."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1643,6 +1703,8 @@ def main() -> None:
             player_fullscreen=args.player_fullscreen,
             mute=args.mute,
         )
+        if args.force_live:
+            controller.seek_player_to_live(mw)
 
         managed_windows = [mw]
         prev = mw
@@ -1746,6 +1808,8 @@ def main() -> None:
                 player_fullscreen=args.player_fullscreen,
                 mute=args.mute,  # <- unmute if you didn't pass --mute
             )
+            if args.force_live:
+                controller.seek_player_to_live(next_mw)
 
             managed_windows = [next_mw]
             prev = next_mw
