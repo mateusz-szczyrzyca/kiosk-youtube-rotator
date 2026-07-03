@@ -383,6 +383,33 @@ class TestStartChrome:
         assert "--no-sandbox" not in args
         assert "--ozone-platform-hint=auto" not in args
 
+    def test_launches_blank_page(self, monkeypatch, tmp_path: Path):
+        # We reuse the launch window for the first video, so it must open a bare
+        # about:blank (not youtube.com) to avoid an idle homepage window.
+        captured = self._capture(monkeypatch)
+        monkeypatch.setattr(ry.sys, "platform", "linux")
+        monkeypatch.setattr(ry.os, "name", "posix")
+        ry.start_chrome("/usr/bin/chromium", 9222, tmp_path)
+        args = captured["args"]
+        assert "about:blank" in args
+        assert "https://youtube.com" not in args
+
+    def test_force_x11_adds_backend_on_linux(self, monkeypatch, tmp_path: Path):
+        captured = self._capture(monkeypatch)
+        monkeypatch.setattr(ry.sys, "platform", "linux")
+        monkeypatch.setattr(ry.os, "name", "posix")
+        ry.start_chrome("/usr/bin/chromium", 9222, tmp_path, force_x11=True)
+        args = captured["args"]
+        assert "--ozone-platform=x11" in args
+
+    def test_force_x11_ignored_off_linux(self, monkeypatch, tmp_path: Path):
+        captured = self._capture(monkeypatch)
+        monkeypatch.setattr(ry.sys, "platform", "darwin")
+        monkeypatch.setattr(ry.os, "name", "posix")
+        ry.start_chrome("/usr/bin/chrome", 9222, tmp_path, force_x11=True)
+        args = captured["args"]
+        assert "--ozone-platform=x11" not in args
+
     def test_stderr_is_captured_to_log(self, monkeypatch, tmp_path: Path):
         captured = self._capture(monkeypatch)
         monkeypatch.setattr(ry.sys, "platform", "linux")

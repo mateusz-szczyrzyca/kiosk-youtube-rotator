@@ -58,11 +58,13 @@ will change and "something new" will come on.
 - Launches Chrome in kiosk mode with the **Chrome DevTools Protocol (CDP)**
   enabled on a local debugging port. Control happens over a CDP websocket
   rather than fragile OS-level key presses.
-- Opens a link, maximizes the window, and (optionally) toggles the **YouTube
-  player's** fullscreen — the in-page player fullscreen, not an OS-level one.
-- For each switch it **preloads the next link in a hidden background window**
-  first; only once that window is ready does it close the current one and
-  promote the new window. This avoids flashing an empty window during the swap.
+- Opens a link and (optionally) toggles the **YouTube player's** fullscreen —
+  the in-page player fullscreen, not an OS-level one.
+- For each switch it **preloads the next link in the background** first; only
+  once it is ready does it drop the current one and bring the new one forward.
+  This avoids flashing an empty screen during the swap. On Linux this happens in
+  a **single kiosk window using tabs** (see below); on Windows/macOS it uses a
+  separate background window per video.
 - The active `--urls` list is **re-read on every switch**, so remote edits
   (picked up on the next refresh) and local edits take effect without a restart.
 
@@ -107,6 +109,19 @@ On Linux the launcher adapts automatically:
 
 - **Wayland/X11:** `--ozone-platform-hint=auto` is passed so Chrome picks the
   right backend on Wayland-default sessions.
+- **Single-window / tab handoff (default on Linux):** Wayland deliberately does
+  not let an application raise its own freshly-created window to the foreground,
+  so the old "preload in a new window, then bring it forward" trick left the new
+  video **hidden behind the old one** until you manually focused Chrome. On
+  Linux the rotator therefore runs everything in **one kiosk window** and
+  switches videos by preloading the next one in a **background tab** and then
+  making it the active tab — the window never leaves the foreground, so the swap
+  is reliable. As a bonus this removes the extra idle window that used to sit
+  underneath at startup (it also pins the profile to `Default` so that single
+  window is deterministically the right profile). Force it either way with
+  `--single-window` / `--no-single-window`. If tab switching ever misbehaves on
+  a specific Wayland setup, `--force-x11` pins Chrome to the X11/XWayland backend
+  as a fallback.
 - **Diagnostics:** Chrome's own stderr is captured to
   `<user-data-dir>/chrome-stderr.log`; if Chrome exits before the debug port
   comes up, the tail of that log is printed to help pinpoint the cause.
@@ -222,6 +237,8 @@ https://www.youtube.com/watch?v=ygedg03NpUQ
 | `--handoff-delay SEC` | `0` | Extra wait *after* the next page has loaded, before swapping. |
 | `--chrome PATH` | auto | Path to the Chrome/Chromium executable. Common locations and `PATH` are tried if omitted (`chrome.exe` on Windows; `google-chrome`, `chromium`, `chromium-browser` on Linux). |
 | `--sandbox` / `--no-sandbox` | auto | Enable/disable Chrome's sandbox. Auto = disabled on Linux (needed for non-snap Chromium on Ubuntu 24.04+/26.04), untouched elsewhere. |
+| `--single-window` / `--no-single-window` | auto | Run in one kiosk window and switch videos via tabs (reliable under Wayland), or use a separate window per video. Auto = on for Linux, off on Windows/macOS. |
+| `--force-x11` | off | Linux only: force Chrome's X11/XWayland backend (`--ozone-platform=x11`) as a fallback for Wayland window quirks. |
 | `--remote-port N` | `9222` | Chrome remote-debugging port. |
 | `--player-fullscreen` | off | Toggle the YouTube player to fullscreen. |
 | `--force-live` / `--no-force-live` | on | For livestreams, seek to the live head instead of a buffered/resumed position. No-op for regular videos (including `%s` random-start links). |

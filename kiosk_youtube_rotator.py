@@ -6,9 +6,12 @@ kiosk_youtube_rotator.py
 Rotate through YouTube URLs in Chrome on Windows 10/11.
 
 Features:
-- Opens first URL, maximizes the window, and toggles the YouTube player to fullscreen (not OS-level fullscreen).
-- Preloads the next URL in a minimized/background window, waits for it to load,
-  optionally waits an extra --handoff-delay, then closes the old window and brings the new one forward.
+- Opens first URL and toggles the YouTube player to fullscreen (not OS-level fullscreen).
+- Preloads the next URL in the background, waits for it to load, optionally
+  waits an extra --handoff-delay, then drops the old one and brings the new one
+  forward. On Linux this runs in a single kiosk window and switches videos via
+  tabs (reliable under Wayland, where an app cannot raise its own new window);
+  on Windows/macOS it uses a separate background window per video.
 - Can use your default Chrome profile (stay logged in) or a separate private profile.
 - Uses Chrome DevTools Protocol (CDP) for reliable per-window control (no fragile SendKeys).
 - Periodically downloads its playlists from remote URLs (e.g. raw GitHub files)
@@ -248,6 +251,7 @@ def start_chrome(
     user_data_dir: Path,
     profile_directory: Optional[str] = None,
     no_sandbox: Optional[bool] = None,
+    force_x11: bool = False,
 ) -> subprocess.Popen[Any]:
     """Start Chrome with remote debugging and return the Popen object.
 
@@ -260,6 +264,10 @@ def start_chrome(
     snap, which otherwise makes Chromium crash on startup before the debug port
     ever opens. Pass ``True``/``False`` to force it either way. On non-Linux
     platforms the sandbox is left untouched regardless of this value.
+
+    ``force_x11`` (Linux only) pins Chrome's Ozone backend to X11/XWayland
+    instead of letting it auto-pick Wayland. It exists as a fallback for the
+    window-management quirks of Wayland; on non-Linux platforms it is ignored.
     """
     is_linux = sys.platform.startswith("linux")
 
@@ -286,8 +294,18 @@ def start_chrome(
         # Let Chromium pick X11 or Wayland at runtime; Ubuntu 26.04 defaults to
         # Wayland where a hard-coded backend would fail to open a window.
         args.append("--ozone-platform-hint=auto")
+        # Optional escape hatch: force the X11/XWayland backend. Kept explicit
+        # (in addition to the hint) so an operator can work around Wayland
+        # window-raising limitations if the single-window/tab mode ever falls
+        # short on a particular setup.
+        if force_x11:
+            args.append("--ozone-platform=x11")
 
-    args += ["--new-window", "https://youtube.com"]
+    # Open a blank page at launch: we reuse this very window (navigating it to
+    # the first video) instead of spawning a second one, so there is never an
+    # idle YouTube homepage window left underneath. A bare about:blank also
+    # avoids briefly flashing a logged-out YouTube homepage on startup.
+    args += ["--new-window", "about:blank"]
 
     # Select a specific profile directory inside the user-data-dir when asked
     # (e.g. "Default", "Profile 1"). Left unset for a fresh private profile.
@@ -523,6 +541,67 @@ class ChromeController:
         if not isinstance(target_id, str):
             raise RuntimeError("Target.createTarget did not return a targetId")
         return target_id
+
+    def create_background_tab(self) -> str:
+        """Create a new TAB (not a new window) in the current kiosk window.
+
+        Uses ``Target.createTarget`` with ``newWindow=False`` so the next video
+        preloads as a background tab of the single foreground window. Switching
+        the active tab later (via ``activate_target``) never requires raising an
+        OS window, which is exactly what Wayland refuses to let an application
+        do to itself -- so the swap stays reliable there.
+        """
+        res = self.browser_conn.call(
+            "Target.createTarget",
+            {"url": "https://youtube.com", "newWindow": False},
+        )
+        target_id = res.get("targetId")
+        if not isinstance(target_id, str):
+            raise RuntimeError("Target.createTarget did not return a targetId")
+        return target_id
+
+    def get_initial_page_target(self, timeout: float = 10.0) -> str:
+        """Return the targetId of the window Chrome opened at launch.
+
+        Reuses the existing kiosk window/tab (a target of type ``"page"``)
+        instead of creating a brand-new window, so the whole rotation lives in a
+        single foreground window. DevTools/background targets are skipped. The
+        lookup is retried briefly because the initial page can appear a moment
+        after the debug port comes up.
+        """
+        deadline = time.time() + timeout
+        last_err: str = "no page target found"
+        while time.time() < deadline:
+            try:
+                for t in self.list_targets():
+                    if t.get("type") != "page":
+                        continue
+                    tid = t.get("id")
+                    if isinstance(tid, str) and tid:
+                        return tid
+            except Exception as exc:
+                last_err = str(exc)
+            time.sleep(0.25)
+        raise RuntimeError(f"Could not find an initial page target: {last_err}")
+
+    def close_other_page_targets(self, keep_target_id: str) -> None:
+        """Close every other ``"page"`` target, keeping only ``keep_target_id``.
+
+        Chrome may open more than one target at launch (e.g. a stray blank tab
+        or a restored window); pruning the extras guarantees a single window
+        with nothing idle left underneath. Best-effort: never fatal.
+        """
+        try:
+            targets = self.list_targets()
+        except Exception as exc:
+            print(f"[WARN] Could not list targets for cleanup: {exc}", file=sys.stderr)
+            return
+        for t in targets:
+            if t.get("type") != "page":
+                continue
+            tid = t.get("id")
+            if isinstance(tid, str) and tid and tid != keep_target_id:
+                self.close_target(tid)
 
     def get_window_id_for_target(self, target_id: str) -> int:
         res = self.browser_conn.call("Browser.getWindowForTarget", {"targetId": target_id})
@@ -1627,6 +1706,29 @@ def main() -> None:
             "random-start links). Use --no-force-live to disable."
         ),
     )
+    parser.add_argument(
+        "--single-window",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Run everything in a SINGLE kiosk window and switch videos via tabs "
+            "instead of separate windows. Default (auto): ON for Linux, where "
+            "Wayland refuses to raise a freshly-created window to the "
+            "foreground (so a new window would stay hidden behind the old one); "
+            "OFF on Windows/macOS to keep the original multi-window behavior. "
+            "This also removes the idle window otherwise left underneath at "
+            "startup. Force with --single-window / --no-single-window."
+        ),
+    )
+    parser.add_argument(
+        "--force-x11",
+        action="store_true",
+        help=(
+            "Linux only: force Chrome's X11/XWayland backend "
+            "(--ozone-platform=x11). A fallback in case single-window tab "
+            "switching still misbehaves on a particular Wayland setup."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1646,6 +1748,14 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
+
+    # Resolve the single-window decision. Default (None) is auto: enable it on
+    # Linux, where Wayland won't let us raise a newly created window over the
+    # old one, and keep the original multi-window behavior everywhere else.
+    if args.single_window is None:
+        single_window = sys.platform.startswith("linux")
+    else:
+        single_window = args.single_window
 
     config_path = Path(args.config)
     base_dir = Path.cwd()
@@ -1750,7 +1860,13 @@ def main() -> None:
         except Exception as exc:
             print(f"[ERROR] Failed to create profile directory {user_data_dir}: {exc}", file=sys.stderr)
             sys.exit(1)
-        profile_directory = None
+        # In single-window mode pin the profile explicitly to "Default" so the
+        # one window we reuse is deterministically the same profile every run
+        # (rather than relying on Chrome's "last used" pick). Equivalent to the
+        # implicit default, but removes any ambiguity behind the reported
+        # "wrong/logged-out profile" window. Left as None elsewhere to keep the
+        # existing multi-window launch byte-for-byte unchanged.
+        profile_directory = "Default" if single_window else None
 
     print(f"[INFO] Using Chrome user-data-dir: {user_data_dir}")
     if profile_directory:
@@ -1760,7 +1876,6 @@ def main() -> None:
     controller: Optional[ChromeController] = None
     managed_windows: List[ManagedWindow] = []
     prev: Optional[ManagedWindow] = None
-    prev_url: Optional[str] = None
     prev_cfg: Optional[URLConfig] = None
     prev_template: Optional[str] = None
 
@@ -1800,6 +1915,7 @@ def main() -> None:
             user_data_dir,
             profile_directory=profile_directory,
             no_sandbox=no_sandbox_choice,
+            force_x11=args.force_x11,
         )
         try:
             controller = ChromeController(args.remote_port)
@@ -1835,14 +1951,24 @@ def main() -> None:
                         )
             raise
 
-        # INITIAL: pick a URL and show it (maximized window + player fullscreen if requested)
+        # INITIAL: pick a URL and show it (player fullscreen if requested).
         current_cfg = choose_url(urls, exclude_template=None)
         current_url = ensure_query_param(render_url(current_cfg), "autoplay", "1")
-        target_id = controller.create_new_window_target()
-        mw = controller.connect_page(target_id)
-        controller.navigate_and_wait(mw, current_url, timeout=90.0)
-        controller.activate_target(mw.target_id)
-        controller.set_window_state(mw.window_id, "maximized")
+        if single_window:
+            # Reuse the window Chrome opened at launch (already kiosk-fullscreen)
+            # and prune any stray extra targets, so exactly ONE window exists and
+            # nothing idle is left underneath.
+            initial_target = controller.get_initial_page_target()
+            mw = controller.connect_page(initial_target)
+            controller.close_other_page_targets(initial_target)
+            controller.navigate_and_wait(mw, current_url, timeout=90.0)
+            controller.activate_target(mw.target_id)
+        else:
+            target_id = controller.create_new_window_target()
+            mw = controller.connect_page(target_id)
+            controller.navigate_and_wait(mw, current_url, timeout=90.0)
+            controller.activate_target(mw.target_id)
+            controller.set_window_state(mw.window_id, "maximized")
         controller.try_autoplay_and_fullscreen_player(
             mw,
             player_fullscreen=args.player_fullscreen,
@@ -1853,7 +1979,6 @@ def main() -> None:
 
         managed_windows = [mw]
         prev = mw
-        prev_url = current_url
         prev_cfg = current_cfg
         prev_template = current_cfg.template
 
@@ -1905,15 +2030,22 @@ def main() -> None:
             # Pick next URL (not equal to previous template if possible)
             next_cfg = choose_url(urls, exclude_template=prev_template)
             next_url = ensure_query_param(render_url(next_cfg), "autoplay", "1")
-            print(f"[INFO] Preloading next URL (muted, minimized): {next_url}")
 
-            # Create background window minimized
-            next_target = controller.create_new_window_target()
-            next_mw = controller.connect_page(next_target)
-            try:
-                controller.set_window_state(next_mw.window_id, "minimized")
-            except Exception:
-                pass
+            # Preload the next video in the background before tearing down the
+            # current one. In single-window mode this is a hidden TAB of the one
+            # kiosk window; otherwise it is a separate minimized window.
+            if single_window:
+                print(f"[INFO] Preloading next URL (muted, background tab): {next_url}")
+                next_target = controller.create_background_tab()
+                next_mw = controller.connect_page(next_target)
+            else:
+                print(f"[INFO] Preloading next URL (muted, minimized): {next_url}")
+                next_target = controller.create_new_window_target()
+                next_mw = controller.connect_page(next_target)
+                try:
+                    controller.set_window_state(next_mw.window_id, "minimized")
+                except Exception:
+                    pass
 
             # Navigate & wait for load
             controller.navigate_and_wait(next_mw, next_url, timeout=90.0)
@@ -1934,31 +2066,52 @@ def main() -> None:
                 time.sleep(args.handoff_delay)
 
             # Swap
-            print("[INFO] Swapping windows...")
-            if prev is not None:
-                try:
-                    controller.close_target(prev.target_id)
-                except Exception as exc:
-                    print(f"[WARN] Failed to close previous window: {exc}", file=sys.stderr)
-                try:
-                    prev.page_conn.close()
-                except Exception:
-                    pass
+            print("[INFO] Swapping to next video...")
+            if single_window:
+                # Bring the preloaded tab to the foreground of the single kiosk
+                # window FIRST, then drop the old tab. Switching the active tab
+                # needs no OS-level window raise, so it stays reliable under
+                # Wayland; activating before closing avoids briefly baring the
+                # desktop between the old tab closing and the new one showing.
+                controller.activate_target(next_mw.target_id)
+                if prev is not None:
+                    try:
+                        controller.close_target(prev.target_id)
+                    except Exception as exc:
+                        print(f"[WARN] Failed to close previous tab: {exc}", file=sys.stderr)
+                    try:
+                        prev.page_conn.close()
+                    except Exception:
+                        pass
+                controller.try_autoplay_and_fullscreen_player(
+                    next_mw,
+                    player_fullscreen=args.player_fullscreen,
+                    mute=args.mute,  # <- unmute if you didn't pass --mute
+                )
+            else:
+                if prev is not None:
+                    try:
+                        controller.close_target(prev.target_id)
+                    except Exception as exc:
+                        print(f"[WARN] Failed to close previous window: {exc}", file=sys.stderr)
+                    try:
+                        prev.page_conn.close()
+                    except Exception:
+                        pass
 
-            # Promote next
-            controller.activate_target(next_mw.target_id)
-            controller.set_window_state(next_mw.window_id, "maximized")
-            controller.try_autoplay_and_fullscreen_player(
-                next_mw,
-                player_fullscreen=args.player_fullscreen,
-                mute=args.mute,  # <- unmute if you didn't pass --mute
-            )
+                # Promote next
+                controller.activate_target(next_mw.target_id)
+                controller.set_window_state(next_mw.window_id, "maximized")
+                controller.try_autoplay_and_fullscreen_player(
+                    next_mw,
+                    player_fullscreen=args.player_fullscreen,
+                    mute=args.mute,  # <- unmute if you didn't pass --mute
+                )
             if args.force_live:
                 controller.seek_player_to_live(next_mw)
 
             managed_windows = [next_mw]
             prev = next_mw
-            prev_url = next_url
             prev_cfg = next_cfg
             prev_template = next_cfg.template
 
