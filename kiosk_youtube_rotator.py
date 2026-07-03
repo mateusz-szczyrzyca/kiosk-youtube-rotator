@@ -140,9 +140,11 @@ def default_validators_dir() -> Path:
 
 
 def find_chrome_exe(user_supplied: Optional[str] = None) -> str:
-    """Find chrome.exe path.
+    """Find the Chrome/Chromium executable path.
 
-    Prefer user-supplied value, otherwise try common locations and PATH.
+    Prefer user-supplied value, otherwise try common locations and PATH. Both
+    Windows (chrome.exe) and Linux (google-chrome / chromium) install layouts
+    are searched so the kiosk runs unattended on either without --chrome.
     """
     if user_supplied:
         try:
@@ -152,9 +154,17 @@ def find_chrome_exe(user_supplied: Optional[str] = None) -> str:
         except Exception as exc:  # pragma: no cover - extremely unlikely
             print(f"[WARN] Failed to resolve user supplied Chrome path: {exc}", file=sys.stderr)
 
+    # Well-known absolute install locations. Windows paths are harmless no-ops on
+    # Linux (they simply don't exist) and vice-versa, so we can list both.
     candidates = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/opt/google/chrome/chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/local/bin/chromium",
     ]
     for c in candidates:
         try:
@@ -164,8 +174,23 @@ def find_chrome_exe(user_supplied: Optional[str] = None) -> str:
             # os.path.exists should not fail, but do not crash if it does
             continue
 
+    # PATH lookup: cover both the Windows binary name and the several names the
+    # Linux Chrome/Chromium packages use. "chrome" is kept first so existing
+    # behavior/tests are preserved.
+    path_names = [
+        "chrome",
+        "chrome.exe",
+        "google-chrome-stable",
+        "google-chrome",
+        "chromium",
+        "chromium-browser",
+    ]
     try:
-        found = shutil.which("chrome") or shutil.which("chrome.exe")
+        found: Optional[str] = None
+        for name in path_names:
+            found = shutil.which(name)
+            if found:
+                break
     except Exception as exc:  # pragma: no cover - defensive
         raise FileNotFoundError(f"Failed to search Chrome in PATH: {exc}") from exc
 
@@ -191,17 +216,53 @@ def is_chrome_running() -> bool:
         return False
 
 
+# Name of the file (inside the Chrome user-data-dir) that captures Chrome's
+# own stderr. Kept as a constant so both start_chrome (writer) and main()
+# (reader, for startup-failure diagnostics) agree on the location.
+CHROME_STDERR_LOG_NAME: str = "chrome-stderr.log"
+
+
+def chrome_stderr_log_path(user_data_dir: Path) -> Path:
+    """Return where Chrome's stderr is captured for a given user-data-dir."""
+    return Path(user_data_dir) / CHROME_STDERR_LOG_NAME
+
+
+def read_chrome_stderr_tail(user_data_dir: Path, max_lines: int = 20) -> str:
+    """Return the last non-blank lines of Chrome's captured stderr.
+
+    Used only for diagnostics when Chrome dies before the debug port opens.
+    Returns an empty string when the log is missing or unreadable so callers
+    can treat "no diagnostics" uniformly.
+    """
+    try:
+        data = chrome_stderr_log_path(user_data_dir).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    lines = [ln for ln in data.splitlines() if ln.strip()]
+    return "\n".join(lines[-max_lines:])
+
+
 def start_chrome(
     chrome_exe: str,
     remote_port: int,
     user_data_dir: Path,
     profile_directory: Optional[str] = None,
+    no_sandbox: Optional[bool] = None,
 ) -> subprocess.Popen[Any]:
     """Start Chrome with remote debugging and return the Popen object.
 
     Chrome is bound to localhost only and remote-allow-origins is relaxed so
     that our DevTools websocket Origin is accepted (avoids a Chrome 403).
+
+    ``no_sandbox`` controls Chrome's setuid/namespace sandbox. ``None`` means
+    "auto": on Linux the sandbox is disabled because Ubuntu 24.04+/26.04 block
+    unprivileged user namespaces via AppArmor for browsers installed outside
+    snap, which otherwise makes Chromium crash on startup before the debug port
+    ever opens. Pass ``True``/``False`` to force it either way. On non-Linux
+    platforms the sandbox is left untouched regardless of this value.
     """
+    is_linux = sys.platform.startswith("linux")
+
     args: List[str] = [
         chrome_exe,
         "--kiosk",
@@ -213,9 +274,21 @@ def start_chrome(
         "--no-default-browser-check",
         "--autoplay-policy=no-user-gesture-required",
         f"--user-data-dir={user_data_dir}",
-        "--new-window",
-        "https://youtube.com",
     ]
+
+    # Linux-specific adaptations. These are no-ops/undesirable elsewhere, so
+    # they stay gated behind the platform check to keep Windows/macOS unchanged.
+    if is_linux:
+        # Auto-resolve the sandbox decision: default to disabling it on Linux.
+        disable_sandbox = True if no_sandbox is None else no_sandbox
+        if disable_sandbox:
+            args += ["--no-sandbox", "--disable-setuid-sandbox"]
+        # Let Chromium pick X11 or Wayland at runtime; Ubuntu 26.04 defaults to
+        # Wayland where a hard-coded backend would fail to open a window.
+        args.append("--ozone-platform-hint=auto")
+
+    args += ["--new-window", "https://youtube.com"]
+
     # Select a specific profile directory inside the user-data-dir when asked
     # (e.g. "Default", "Profile 1"). Left unset for a fresh private profile.
     if profile_directory:
@@ -226,12 +299,24 @@ def start_chrome(
         # Start in a new process group, detached from this console.
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
 
+    # Capture Chrome's stderr to a log file instead of discarding it, so that a
+    # startup crash (e.g. the sandbox/AppArmor failure above) leaves a trace the
+    # caller can surface. Best-effort: fall back to DEVNULL if the file can't be
+    # opened so we never block launch on logging.
+    stderr_target: Any = subprocess.DEVNULL
+    try:
+        log_path = chrome_stderr_log_path(user_data_dir)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        stderr_target = open(log_path, "wb")
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[WARN] Could not open Chrome stderr log: {exc}", file=sys.stderr)
+
     try:
         proc = subprocess.Popen(
             args,
             creationflags=creationflags,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=stderr_target,
         )
     except Exception as exc:
         raise RuntimeError(f"Failed to start Chrome: {exc}") from exc
@@ -1468,7 +1553,22 @@ def main() -> None:
         "--chrome",
         type=str,
         default=None,
-        help="Path to chrome.exe. If omitted, common paths/PATH are tried.",
+        help=(
+            "Path to the Chrome/Chromium executable. If omitted, common paths "
+            "and PATH are tried (chrome.exe on Windows; google-chrome, "
+            "chromium, chromium-browser on Linux)."
+        ),
+    )
+    parser.add_argument(
+        "--sandbox",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable/disable Chrome's sandbox. Default (auto): disabled on Linux "
+            "because Ubuntu 24.04+/26.04 block unprivileged user namespaces for "
+            "non-snap Chromium (which otherwise crashes on startup); left "
+            "untouched elsewhere. Use --sandbox to force it on."
+        ),
     )
     parser.add_argument(
         "--remote-port",
@@ -1685,10 +1785,55 @@ def main() -> None:
                 except Exception:
                     pass
 
+    # Resolve the sandbox choice from the CLI: --sandbox / --no-sandbox map to
+    # a tri-state (None = let start_chrome auto-decide per platform).
+    if args.sandbox is None:
+        no_sandbox_choice: Optional[bool] = None
+    else:
+        no_sandbox_choice = not args.sandbox
+
     try:
         # Start Chrome and connect to CDP
-        chrome_proc = start_chrome(chrome_exe, args.remote_port, user_data_dir, profile_directory=profile_directory)
-        controller = ChromeController(args.remote_port)
+        chrome_proc = start_chrome(
+            chrome_exe,
+            args.remote_port,
+            user_data_dir,
+            profile_directory=profile_directory,
+            no_sandbox=no_sandbox_choice,
+        )
+        try:
+            controller = ChromeController(args.remote_port)
+        except Exception:
+            # The debug port never came up. If Chrome already exited, surface its
+            # own stderr and an Ubuntu-specific hint, since a non-snap Chromium
+            # crashing on startup is by far the most common cause here.
+            if chrome_proc.poll() is not None:
+                tail = read_chrome_stderr_tail(user_data_dir)
+                if tail:
+                    print(
+                        f"[ERROR] Chrome exited during startup. Last output:\n{tail}",
+                        file=sys.stderr,
+                    )
+                if sys.platform.startswith("linux"):
+                    sandbox_disabled = True if no_sandbox_choice is None else no_sandbox_choice
+                    if not sandbox_disabled:
+                        print(
+                            "[ERROR] On Ubuntu 24.04+/26.04 a Chromium installed "
+                            "outside snap often crashes because AppArmor blocks "
+                            "unprivileged user namespaces. Re-run with --no-sandbox, "
+                            "or allow user namespaces: sudo sysctl -w "
+                            "kernel.apparmor_restrict_unprivileged_userns=0",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            "[ERROR] Chrome exited with the sandbox already disabled. "
+                            "Check that a display is available (DISPLAY/WAYLAND_DISPLAY "
+                            "for the session) and that --chrome points at a real "
+                            "Chrome/Chromium binary (not a snap wrapper).",
+                            file=sys.stderr,
+                        )
+            raise
 
         # INITIAL: pick a URL and show it (maximized window + player fullscreen if requested)
         current_cfg = choose_url(urls, exclude_template=None)

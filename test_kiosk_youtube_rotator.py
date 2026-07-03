@@ -308,6 +308,96 @@ class TestFindChromeExe:
         # The hardcoded Windows candidates won't exist on this OS either.
         assert ry.find_chrome_exe(missing) == "/usr/bin/chrome"
 
+    def test_finds_chromium_via_path(self, monkeypatch):
+        # On Linux the binary is typically named chromium (not chrome), so the
+        # PATH fallback must also try that name.
+        monkeypatch.setattr(ry.os.path, "exists", lambda p: False)
+        monkeypatch.setattr(
+            ry.shutil,
+            "which",
+            lambda name: "/usr/bin/chromium" if name == "chromium" else None,
+        )
+        assert ry.find_chrome_exe(None) == "/usr/bin/chromium"
+
+    def test_finds_google_chrome_absolute_candidate(self, monkeypatch):
+        # A Linux absolute-path install location should be discovered directly.
+        monkeypatch.setattr(
+            ry.os.path,
+            "exists",
+            lambda p: p == "/usr/bin/google-chrome-stable",
+        )
+        monkeypatch.setattr(ry.shutil, "which", lambda name: None)
+        assert ry.find_chrome_exe(None) == "/usr/bin/google-chrome-stable"
+
+
+# ---------------------------------------------------------------------------
+# start_chrome (launch flag construction)
+# ---------------------------------------------------------------------------
+
+
+class TestStartChrome:
+    """Verify the platform-adapted launch flags without actually launching."""
+
+    def _capture(self, monkeypatch) -> dict:
+        captured: dict = {}
+
+        class _FakePopen:
+            def __init__(self, args, **kwargs):
+                captured["args"] = args
+                captured["kwargs"] = kwargs
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(ry.subprocess, "Popen", _FakePopen)
+        return captured
+
+    def test_linux_disables_sandbox_by_default(self, monkeypatch, tmp_path: Path):
+        captured = self._capture(monkeypatch)
+        monkeypatch.setattr(ry.sys, "platform", "linux")
+        monkeypatch.setattr(ry.os, "name", "posix")
+        ry.start_chrome("/usr/bin/chromium", 9222, tmp_path)
+        args = captured["args"]
+        assert "--no-sandbox" in args
+        assert "--disable-setuid-sandbox" in args
+        assert "--ozone-platform-hint=auto" in args
+
+    def test_linux_sandbox_can_be_forced_on(self, monkeypatch, tmp_path: Path):
+        captured = self._capture(monkeypatch)
+        monkeypatch.setattr(ry.sys, "platform", "linux")
+        monkeypatch.setattr(ry.os, "name", "posix")
+        ry.start_chrome("/usr/bin/chromium", 9222, tmp_path, no_sandbox=False)
+        args = captured["args"]
+        assert "--no-sandbox" not in args
+        assert "--disable-setuid-sandbox" not in args
+        # The Ozone hint is unrelated to the sandbox and stays on Linux.
+        assert "--ozone-platform-hint=auto" in args
+
+    def test_non_linux_has_no_linux_flags(self, monkeypatch, tmp_path: Path):
+        # darwin stands in for any non-Linux platform: no sandbox/Ozone flags.
+        captured = self._capture(monkeypatch)
+        monkeypatch.setattr(ry.sys, "platform", "darwin")
+        monkeypatch.setattr(ry.os, "name", "posix")
+        ry.start_chrome("/usr/bin/chrome", 9222, tmp_path)
+        args = captured["args"]
+        assert "--no-sandbox" not in args
+        assert "--ozone-platform-hint=auto" not in args
+
+    def test_stderr_is_captured_to_log(self, monkeypatch, tmp_path: Path):
+        captured = self._capture(monkeypatch)
+        monkeypatch.setattr(ry.sys, "platform", "linux")
+        monkeypatch.setattr(ry.os, "name", "posix")
+        ry.start_chrome("/usr/bin/chromium", 9222, tmp_path)
+        stderr_target = captured["kwargs"]["stderr"]
+        # Chrome's stderr must go to a real log file, not be discarded, so a
+        # startup crash can be diagnosed.
+        assert stderr_target is not ry.subprocess.DEVNULL
+        assert ry.chrome_stderr_log_path(tmp_path).exists()
+        try:
+            stderr_target.close()
+        except Exception:
+            pass
+
 
 # ---------------------------------------------------------------------------
 # URLConfig dataclass defaults

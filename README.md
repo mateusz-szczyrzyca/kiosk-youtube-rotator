@@ -1,6 +1,10 @@
 # kiosk_youtube_rotator
 
-A tiny, unattended **YouTube rotator** for a TV or any spare screen.
+A tiny, unattended **YouTube rotator** for a TV or any spare screen. 
+
+***WARNING:*** it requires a computer with "normal" operating system (Windows/macOS/Linux), does not work natively on TV OSes - it's not an app for TV! It's only for scenario that you use your TV as a screen for external computer (my case). I found out using 
+separate desktop computer (but in mini case) for TV gives the best results, instead of relying on TV native OS and apps as they 
+are severly limited.
 
 You give it **one active playlist** of YouTube links (`--urls`). Every so often
 it picks a **random** link from that list, opens it in a fullscreen,
@@ -75,15 +79,42 @@ will change and "something new" will come on.
 - Stale-list cleanup only ever deletes files the program itself created (tracked
   in a metadata manifest), so your own local files are never removed.
 
-> **Platform:** Chrome control is built around Windows (process handling,
-> `tasklist`/`taskkill`, the default profile path). The parsing, downloading and
-> URL-handling logic is platform-independent and unit-tested everywhere, but the
-> rotator itself is intended to run on Windows 10/11.
+> **Platform:** Primary target is Windows 10/11 (process handling,
+> `tasklist`/`taskkill`, the default profile path). It also runs on Linux
+> (tested against Ubuntu 26.04): binary discovery and launch flags auto-adapt
+> (see [Linux / Ubuntu notes](#linux--ubuntu-notes)). The parsing, downloading
+> and URL-handling logic is platform-independent and unit-tested everywhere.
+
+### Linux / Ubuntu notes
+
+On Linux the launcher adapts automatically:
+
+- **Binary discovery:** if `--chrome` is omitted, common Linux locations and
+  PATH names are tried (`google-chrome`, `google-chrome-stable`, `chromium`,
+  `chromium-browser`) in addition to Windows' `chrome.exe`.
+- **Sandbox:** on Ubuntu 24.04+/26.04, AppArmor blocks unprivileged user
+  namespaces for a Chromium installed **outside snap**, which makes Chromium
+  crash on startup *before* the remote-debugging port opens (you'd see
+  `[ERROR] Chrome remote debugging port 9222 not responding`). To avoid this,
+  the sandbox is **disabled by default on Linux** (`--no-sandbox`). Use
+  `--sandbox` to force it back on. As an alternative that keeps the sandbox,
+  either install a Chromium that ships an AppArmor profile, or relax the kernel
+  setting:
+
+  ```bash
+  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+  ```
+
+- **Wayland/X11:** `--ozone-platform-hint=auto` is passed so Chrome picks the
+  right backend on Wayland-default sessions.
+- **Diagnostics:** Chrome's own stderr is captured to
+  `<user-data-dir>/chrome-stderr.log`; if Chrome exits before the debug port
+  comes up, the tail of that log is printed to help pinpoint the cause.
 
 ## Requirements
 
-- Windows 10/11
-- Google Chrome
+- Windows 10/11, or Linux (e.g. tested on Ubuntu 26.04)
+- Google Chrome or Chromium (tested on Ubuntu, chromium installed by apt/deb, not snap)
 - Python 3.8+
 - Python packages:
 
@@ -189,7 +220,8 @@ https://www.youtube.com/watch?v=ygedg03NpUQ
 | `--min-delay SEC` | `120` | Minimum delay between switches. |
 | `--max-delay SEC` | `600` | Maximum delay between switches. |
 | `--handoff-delay SEC` | `0` | Extra wait *after* the next page has loaded, before swapping. |
-| `--chrome PATH` | auto | Path to `chrome.exe`. Common locations and `PATH` are tried if omitted. |
+| `--chrome PATH` | auto | Path to the Chrome/Chromium executable. Common locations and `PATH` are tried if omitted (`chrome.exe` on Windows; `google-chrome`, `chromium`, `chromium-browser` on Linux). |
+| `--sandbox` / `--no-sandbox` | auto | Enable/disable Chrome's sandbox. Auto = disabled on Linux (needed for non-snap Chromium on Ubuntu 24.04+/26.04), untouched elsewhere. |
 | `--remote-port N` | `9222` | Chrome remote-debugging port. |
 | `--player-fullscreen` | off | Toggle the YouTube player to fullscreen. |
 | `--force-live` / `--no-force-live` | on | For livestreams, seek to the live head instead of a buffered/resumed position. No-op for regular videos (including `%s` random-start links). |
