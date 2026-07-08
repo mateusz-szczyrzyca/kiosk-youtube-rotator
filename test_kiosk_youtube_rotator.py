@@ -1215,3 +1215,180 @@ class TestSeekPlayerToLive:
         _run_seek_to_live(conn)  # should not raise
         assert len(conn.calls) == 1
 
+
+# ---------------------------------------------------------------------------
+# Self-update: fetch_remote_script  (requests.get mocked)
+# ---------------------------------------------------------------------------
+#
+# The self-update layer is pure/deterministic apart from reexec_self(), which
+# replaces the process image (os.execv) and therefore belongs to the same
+# integration-test territory as the CDP/main() loop. Everything below is unit-
+# testable with requests.get mocked and a tmp_path standing in for the script.
+
+
+class TestFetchRemoteScript:
+    def test_successful_download_returns_bytes(self, monkeypatch):
+        body = b"#!/usr/bin/env python3\nprint('v2')\n"
+        monkeypatch.setattr(ry.requests, "get", lambda u, **k: _FakeResponse(body))
+        assert ry.fetch_remote_script("https://x/script.py") == body
+
+    def test_http_error_returns_none(self, monkeypatch):
+        monkeypatch.setattr(
+            ry.requests, "get", lambda u, **k: _FakeResponse(b"nope", status=500)
+        )
+        assert ry.fetch_remote_script("https://x/script.py") is None
+
+    def test_network_error_returns_none(self, monkeypatch):
+        def boom(u, **k):
+            raise ry.requests.RequestException("connection refused")
+
+        monkeypatch.setattr(ry.requests, "get", boom)
+        assert ry.fetch_remote_script("https://x/script.py") is None
+
+    def test_empty_body_returns_none(self, monkeypatch):
+        monkeypatch.setattr(ry.requests, "get", lambda u, **k: _FakeResponse(b""))
+        assert ry.fetch_remote_script("https://x/script.py") is None
+
+    def test_default_timeout_is_forwarded(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_get(u, **k):
+            captured["timeout"] = k.get("timeout")
+            return _FakeResponse(b"data")
+
+        monkeypatch.setattr(ry.requests, "get", fake_get)
+        ry.fetch_remote_script("https://x/script.py")
+        # The 5s (SELF_UPDATE_TIMEOUT) budget must reach requests.get so an
+        # unreachable repo is given up on instead of stalling startup.
+        assert captured["timeout"] == ry.SELF_UPDATE_TIMEOUT
+
+    def test_explicit_timeout_is_forwarded(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_get(u, **k):
+            captured["timeout"] = k.get("timeout")
+            return _FakeResponse(b"data")
+
+        monkeypatch.setattr(ry.requests, "get", fake_get)
+        ry.fetch_remote_script("https://x/script.py", timeout=1.25)
+        assert captured["timeout"] == 1.25
+
+
+# ---------------------------------------------------------------------------
+# Self-update: is_new_version
+# ---------------------------------------------------------------------------
+
+
+class TestIsNewVersion:
+    def test_identical_bytes_is_not_new(self, tmp_path: Path):
+        local = tmp_path / "script.py"
+        local.write_bytes(b"same\n")
+        assert ry.is_new_version(b"same\n", local) is False
+
+    def test_different_bytes_is_new(self, tmp_path: Path):
+        local = tmp_path / "script.py"
+        local.write_bytes(b"old\n")
+        assert ry.is_new_version(b"new\n", local) is True
+
+    def test_empty_remote_is_never_new(self, tmp_path: Path):
+        local = tmp_path / "script.py"
+        local.write_bytes(b"old\n")
+        assert ry.is_new_version(b"", local) is False
+
+    def test_missing_local_is_treated_as_new(self, tmp_path: Path):
+        assert ry.is_new_version(b"anything\n", tmp_path / "missing.py") is True
+
+
+# ---------------------------------------------------------------------------
+# Self-update: apply_self_update
+# ---------------------------------------------------------------------------
+
+
+class TestApplySelfUpdate:
+    def test_overwrites_and_leaves_no_part_file(self, tmp_path: Path):
+        local = tmp_path / "script.py"
+        local.write_bytes(b"old\n")
+        assert ry.apply_self_update(b"new-body\n", local) is True
+        assert local.read_bytes() == b"new-body\n"
+        assert not local.with_name(local.name + ".part").exists()
+
+    def test_preserves_executable_mode(self, tmp_path: Path):
+        import os
+        import stat
+
+        local = tmp_path / "script.py"
+        local.write_bytes(b"old\n")
+        local.chmod(0o755)
+        assert ry.apply_self_update(b"new\n", local) is True
+        mode = os.stat(local).st_mode
+        # The executable bits must survive the replacement.
+        assert mode & stat.S_IXUSR
+
+    def test_failure_returns_false_and_keeps_original(self, tmp_path: Path, monkeypatch):
+        local = tmp_path / "script.py"
+        local.write_bytes(b"original\n")
+
+        def boom(src, dst):
+            raise OSError("cannot replace")
+
+        monkeypatch.setattr(ry.os, "replace", boom)
+        assert ry.apply_self_update(b"new\n", local) is False
+        # The running script must be left intact on a failed write.
+        assert local.read_bytes() == b"original\n"
+        # The partial file is cleaned up.
+        assert not local.with_name(local.name + ".part").exists()
+
+
+# ---------------------------------------------------------------------------
+# Self-update: check_and_apply_self_update
+# ---------------------------------------------------------------------------
+
+
+class TestCheckAndApplySelfUpdate:
+    def test_unreachable_repo_returns_false_and_keeps_file(self, tmp_path: Path, monkeypatch):
+        local = tmp_path / "script.py"
+        local.write_bytes(b"current\n")
+
+        def boom(u, **k):
+            raise ry.requests.RequestException("connection refused")
+
+        monkeypatch.setattr(ry.requests, "get", boom)
+        assert ry.check_and_apply_self_update(local, "https://x/script.py") is False
+        assert local.read_bytes() == b"current\n"
+
+    def test_identical_remote_returns_false_and_keeps_file(self, tmp_path: Path, monkeypatch):
+        local = tmp_path / "script.py"
+        local.write_bytes(b"current\n")
+        monkeypatch.setattr(
+            ry.requests, "get", lambda u, **k: _FakeResponse(b"current\n")
+        )
+        assert ry.check_and_apply_self_update(local, "https://x/script.py") is False
+        assert local.read_bytes() == b"current\n"
+
+    def test_newer_remote_updates_file_and_returns_true(self, tmp_path: Path, monkeypatch):
+        local = tmp_path / "script.py"
+        local.write_bytes(b"current\n")
+        monkeypatch.setattr(
+            ry.requests, "get", lambda u, **k: _FakeResponse(b"brand-new\n")
+        )
+        assert ry.check_and_apply_self_update(local, "https://x/script.py") is True
+        assert local.read_bytes() == b"brand-new\n"
+
+
+# ---------------------------------------------------------------------------
+# Self-update: self_update_should_run  (re-exec loop guard)
+# ---------------------------------------------------------------------------
+
+
+class TestSelfUpdateShouldRun:
+    def test_disabled_never_runs(self):
+        assert ry.self_update_should_run(False, {}) is False
+
+    def test_enabled_with_clean_env_runs(self):
+        assert ry.self_update_should_run(True, {}) is True
+
+    def test_guard_env_blocks_second_check(self):
+        env = {ry.SELF_UPDATE_GUARD_ENV: "1"}
+        # The freshly-restarted (already-updated) process must skip the check.
+        assert ry.self_update_should_run(True, env) is False
+

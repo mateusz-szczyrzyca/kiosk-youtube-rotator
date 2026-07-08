@@ -96,7 +96,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple
 
 import requests
 from websocket import WebSocket, create_connection
@@ -132,6 +132,27 @@ DEFAULT_VALIDATORS_DIR_NAME: str = "kiosk_youtube_rotator_meta"
 # often AFTER a single seek would run, so one shot is not enough: we keep
 # nudging back to the live head for this long, then the watchdog clears itself.
 FORCE_LIVE_WATCHDOG_SECONDS: int = 20
+
+# Self-update: the raw URL the script pulls its own newer copy from at startup
+# (opt-in via --self-update). Kept as a constant default so the kiosk box needs
+# no extra configuration; --self-update-url overrides it for forks/branches.
+SELF_UPDATE_URL_DEFAULT: str = (
+    "https://raw.githubusercontent.com/mateusz-szczyrzyca/"
+    "kiosk-youtube-rotator/main/kiosk_youtube_rotator.py"
+)
+
+# How long (seconds) the startup self-update check may take before it is given
+# up on. requests applies this to both the connect and read phases, so an
+# unreachable or hung repository can never stall the kiosk's launch: after this
+# we simply run the version already on disk and re-check on the next launch.
+SELF_UPDATE_TIMEOUT: float = 5.0
+
+# Environment-variable name used as a re-exec loop guard. It is set right before
+# os.execv so the freshly-launched (already-updated) process skips the update
+# check exactly once; a later, fresh launch (without this variable) checks
+# again. This prevents an infinite update->restart loop if the comparison were
+# ever to keep reporting a difference.
+SELF_UPDATE_GUARD_ENV: str = "KIOSK_ROTATOR_SELF_UPDATED"
 
 
 def default_validators_dir() -> Path:
@@ -1668,6 +1689,145 @@ def load_all_urls(
 
 
 # -------------------------
+# Self-update
+# -------------------------
+#
+# Opt-in (--self-update): at startup the script can fetch its own newer copy
+# from the repository, atomically replace the file on disk, and re-exec itself
+# with the identical arguments. If the repo is unreachable within
+# SELF_UPDATE_TIMEOUT, or there is no newer version, it simply runs the current
+# code and re-checks on the next launch. The download reuses `requests` (already
+# a dependency) so no external downloader is needed, and mirrors the atomic
+# ".part" + os.replace invariant used by the list-download layer so a failed or
+# partial fetch can never corrupt the running script.
+
+
+def fetch_remote_script(url: str, timeout: float = SELF_UPDATE_TIMEOUT) -> Optional[bytes]:
+    """Download the remote copy of the script, or return None on any problem.
+
+    Returns the response body as bytes on a successful, non-empty 2xx response.
+    Returns None (after logging a ``[WARN]``) on a network error, timeout,
+    non-2xx status, or an empty body. The ``timeout`` is passed to
+    ``requests.get`` for both the connect and read phases, so an unreachable or
+    hung repository is given up on rather than stalling startup -- exactly the
+    "after N seconds, fall back to the current version" behaviour.
+    """
+    try:
+        resp = requests.get(url, timeout=timeout, allow_redirects=True)
+        resp.raise_for_status()
+        content = resp.content
+    except Exception as exc:  # network error, timeout, HTTP error, etc.
+        print(f"[WARN] Self-update check failed for {url}: {exc}", file=sys.stderr)
+        return None
+
+    # An empty body is treated as a failed check so it never replaces the
+    # running script with nothing (mirrors the list-download layer).
+    if not content:
+        print(f"[WARN] Self-update check for {url} returned an empty body.", file=sys.stderr)
+        return None
+    return content
+
+
+def is_new_version(remote: bytes, local_path: Path) -> bool:
+    """Return True when ``remote`` is a genuinely different version than local.
+
+    Detection is a byte-for-byte comparison against the file currently on disk,
+    so no ``__version__`` bookkeeping is required. An empty ``remote`` is never
+    considered new. If the local file is missing or unreadable we treat the
+    remote as new, since there is then nothing valid to keep.
+    """
+    if not remote:
+        return False
+    try:
+        return local_path.read_bytes() != remote
+    except Exception:
+        return True
+
+
+def apply_self_update(remote: bytes, local_path: Path) -> bool:
+    """Atomically overwrite ``local_path`` with ``remote``; return success.
+
+    Writes to a sibling ``".part"` temp file and ``os.replace``s it into place,
+    so an interrupted write can never leave the running script truncated. The
+    original file's permission bits (e.g. the executable flag) are carried over
+    to the replacement. Any failure is logged and reported as ``False`` with the
+    partial file cleaned up, so the caller can fall back to the current version.
+    """
+    tmp = local_path.with_name(local_path.name + ".part")
+    try:
+        tmp.write_bytes(remote)
+        # Preserve the current file mode (notably the executable bit) so the
+        # replacement stays runnable exactly like the original.
+        try:
+            shutil.copymode(local_path, tmp)
+        except Exception:
+            # Missing/unreadable source mode must not abort the update.
+            pass
+        os.replace(tmp, local_path)
+        return True
+    except Exception as exc:
+        print(f"[WARN] Failed to apply self-update to {local_path}: {exc}", file=sys.stderr)
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def check_and_apply_self_update(
+    script_path: Path,
+    url: str,
+    timeout: float = SELF_UPDATE_TIMEOUT,
+) -> bool:
+    """Fetch, compare and (if newer) replace the script; return whether it updated.
+
+    Returns True only when a genuinely newer version was downloaded AND written
+    to ``script_path``. Every other outcome -- repo unreachable/timed out, empty
+    body, identical bytes, or a failed write -- returns False so the caller runs
+    the version already on disk.
+    """
+    remote = fetch_remote_script(url, timeout=timeout)
+    if remote is None:
+        return False
+    if not is_new_version(remote, script_path):
+        return False
+    return apply_self_update(remote, script_path)
+
+
+def self_update_should_run(enabled: bool, environ: Mapping[str, str]) -> bool:
+    """Decide whether the startup self-update check should run.
+
+    It runs only when the user opted in (``enabled``) AND the re-exec guard
+    variable is absent from ``environ``. The guard is present exactly in the
+    process we just restarted after an update, so that run skips the check;
+    a later, fresh launch checks again.
+    """
+    return enabled and SELF_UPDATE_GUARD_ENV not in environ
+
+
+def reexec_self(argv: List[str]) -> NoReturn:
+    """Restart the (freshly updated) script with the same arguments.
+
+    Uses ``os.execv`` to replace the current process image rather than spawning
+    a child: the inherited stdout/stderr file descriptors (including any shell
+    redirection or pipe) are preserved, so logging continues seamlessly across
+    the restart. The loop-guard environment variable is set first so the new
+    process does not immediately try to update again.
+    """
+    # Flush our own buffered output so nothing is lost when the image is
+    # replaced (execv does not run atexit handlers or flush Python buffers).
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os.environ[SELF_UPDATE_GUARD_ENV] = "1"
+    script = os.path.abspath(__file__)
+    os.execv(sys.executable, [sys.executable, script, *argv])
+
+
+# -------------------------
 # Main
 # -------------------------
 
@@ -1847,6 +2007,28 @@ def main() -> None:
             "switching still misbehaves on a particular Wayland setup."
         ),
     )
+    parser.add_argument(
+        "--self-update",
+        action="store_true",
+        help=(
+            "At startup, check the repository for a newer version of this "
+            "script; if found, download it, replace this file, and restart with "
+            "the same arguments (stdout logging is preserved across the "
+            "restart). If the repo is unreachable within "
+            f"{int(SELF_UPDATE_TIMEOUT)}s or there is no new version, the "
+            "current version keeps running and the check repeats on the next "
+            "launch. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--self-update-url",
+        type=str,
+        default=SELF_UPDATE_URL_DEFAULT,
+        help=(
+            "URL to fetch the newer script from when --self-update is used "
+            f"(default: {SELF_UPDATE_URL_DEFAULT})."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1866,6 +2048,20 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
+
+    # Self-update (opt-in): before doing any real work, see if the repository has
+    # a newer copy of this script. On success we re-exec with the same arguments
+    # (which does not return); every failure mode is non-fatal and simply falls
+    # through to running the version already on disk. The guard env var makes the
+    # freshly-restarted process skip this block exactly once.
+    if self_update_should_run(args.self_update, os.environ):
+        script_path = Path(os.path.abspath(__file__))
+        try:
+            if check_and_apply_self_update(script_path, args.self_update_url):
+                print("[INFO] Updated to a newer version; restarting...")
+                reexec_self(sys.argv[1:])  # replaces the process; does not return
+        except Exception as exc:  # never let self-update block startup
+            print(f"[WARN] Self-update skipped: {exc}", file=sys.stderr)
 
     # Resolve the single-window decision. Default (None) is auto: enable it on
     # Linux, where Wayland won't let us raise a newly created window over the

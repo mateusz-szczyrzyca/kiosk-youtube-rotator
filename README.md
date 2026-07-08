@@ -81,6 +81,27 @@ will change and "something new" will come on.
 - Stale-list cleanup only ever deletes files the program itself created (tracked
   in a metadata manifest), so your own local files are never removed.
 
+### Self-update (opt-in)
+
+Pass `--self-update` to have the script keep *itself* fresh. At startup it
+fetches its own newer copy from the repository (default: the raw GitHub `main`
+file; override with `--self-update-url`), and:
+
+- if a **newer version** is found, it downloads it, **atomically replaces** the
+  file on disk (a `.part` temp file is `os.replace`d in, so an interrupted write
+  never corrupts the running script), and **restarts with the same arguments**.
+  The restart uses `os.execv`, so the process keeps the same stdout/stderr —
+  **existing logs (and any redirection/pipe) are not lost** across the swap;
+- if there is **no new version**, it just runs as usual;
+- if the **repository is unreachable**, it gives up after a **5-second timeout**
+  and runs the version already on disk. The check simply repeats on the next
+  launch.
+
+Detection is a byte-for-byte comparison against the local file, so no version
+bookkeeping is needed. A re-exec guard makes the freshly-restarted (already
+updated) process skip the check exactly once, preventing an update→restart loop.
+Off by default.
+
 > **Platform:** Primary target is Windows 10/11 (process handling,
 > `tasklist`/`taskkill`, the default profile path). It also runs on Linux
 > (tested against Ubuntu 26.04): binary discovery and launch flags auto-adapt
@@ -255,6 +276,8 @@ https://www.youtube.com/watch?v=ygedg03NpUQ
 | `--use-default-profile` | off | Use your normal Chrome profile (stay logged in). Close Chrome first or use `--force-close-chrome`. |
 | `--profile-directory NAME` | `Default` | Profile directory name inside *User Data* (e.g. `Default`, `Profile 1`). |
 | `--force-close-chrome` | off | With `--use-default-profile`, force-close running Chrome first. |
+| `--self-update` | off | At startup, check the repository for a newer version of this script; if found, download it, replace the file, and restart with the same arguments (stdout logging is preserved). Falls back to the current version if the repo is unreachable within 5s or there is no new version. |
+| `--self-update-url URL` | raw GitHub `main` | URL to fetch the newer script from when `--self-update` is used. |
 
 By default the script uses a **separate, private Chrome profile** in
 `./chrome_profile`, so it never touches your everyday Chrome. Use
