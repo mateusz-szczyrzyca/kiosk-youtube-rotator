@@ -3,7 +3,7 @@
 """
 kiosk_youtube_rotator.py
 ---
-Rotate through YouTube URLs in Chrome on Windows 10/11.
+Rotate through YouTube URLs in Chrome on Windows 10/11, macOS and Ubuntu.
 
 Features:
 - Opens first URL and toggles the YouTube player to fullscreen (not OS-level fullscreen).
