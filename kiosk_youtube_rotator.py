@@ -126,6 +126,13 @@ LISTS_FETCH_TIMEOUT: float = 60.0
 # system-dependent, possibly-volatile location is perfectly acceptable.
 DEFAULT_VALIDATORS_DIR_NAME: str = "kiosk_youtube_rotator_meta"
 
+# How long (seconds) the in-page --force-live watchdog keeps re-pinning a
+# livestream to the live head after a window is brought to the foreground.
+# YouTube restores a remembered/DVR position *asynchronously* (after canplay),
+# often AFTER a single seek would run, so one shot is not enough: we keep
+# nudging back to the live head for this long, then the watchdog clears itself.
+FORCE_LIVE_WATCHDOG_SECONDS: int = 20
+
 
 def default_validators_dir() -> Path:
     """Return the default directory for cached conditional-request validators.
@@ -784,7 +791,7 @@ class ChromeController:
             pass
 
         # Small wait to allow focus to settle
-        time.sleep(3.5)
+        time.sleep(5)
 
         # 4) Toggle player fullscreen via 'f'
         try:
@@ -817,44 +824,155 @@ class ChromeController:
 
     def seek_player_to_live(self, mw: ManagedWindow) -> None:
         """
-        Best-effort: if the foreground video is a *livestream*, jump it to the
-        live head instead of wherever YouTube resumed it (DVR buffer / a
-        remembered position in the persistent Chrome profile).
+        Best-effort: if the foreground video is a *livestream*, gently correct
+        it to the live head instead of wherever YouTube resumed it (DVR buffer /
+        a remembered position in the persistent Chrome profile).
 
         This is kept separate from ``try_autoplay_and_fullscreen_player`` on
-        purpose: it must only ever run on true livestreams, and only once a
+        purpose: it must only ever act on true livestreams, and only once a
         window is in the foreground (seeking during background preload would
         just drift behind live again before the swap).
 
-        The live detection is intentionally strict: only genuine livestreams
-        report ``video.duration === Infinity``. Regular VODs -- including
-        ``%s`` random-start links and finished/past livestreams that are now
-        recordings -- have a finite duration, so their start position is left
-        completely untouched.
+        Why a *watchdog* and not a single seek: YouTube restores a
+        remembered/DVR position **asynchronously** (after ``canplay``), which
+        frequently fires *after* a one-shot seek would run, silently undoing it.
+        So we install a short-lived, self-clearing in-page ``setInterval`` that
+        watches for such a backward jump. It is still a single CDP round-trip;
+        all the waiting happens inside the page.
+
+        Crucially the watchdog is *gentle and self-terminating*, not a hammer:
+        when it detects a real backward jump it issues ONE native "go to live"
+        (a ``.ytp-live-badge`` click -- YouTube's own smooth catch-up), then
+        holds a short cooldown so the seek can settle before re-checking. It
+        stops the moment the stream sticks at the live head, caps the number of
+        corrections, and never fires several seek mechanisms at once -- that
+        combination is what previously caused a visible past<->live ping-pong.
+
+        Live detection uses YouTube's own player API
+        (``#movie_player.getVideoData().isLive``), which is ``true`` only for a
+        *currently-running* broadcast. Finished streams that became VODs -- and
+        ``%s`` random-start links -- report ``false``, so their start position
+        is left completely untouched. ``video.duration === Infinity`` and a
+        visible ``.ytp-live-badge`` are kept only as fallbacks for when the
+        player API is not (yet) exposed. DVR-enabled livestreams (exactly the
+        ones YouTube "remembers") report a *finite* duration, so we must NOT
+        gate on ``duration === Infinity`` alone -- that skipped precisely the
+        streams that needed fixing.
         """
 
-        # NOTE: %% is escaped for Python's %-formatting even though we don't
-        # interpolate here; keep the JS free of stray % to avoid surprises.
+        # The JS carries no "%" of its own; inject the watchdog length with a
+        # plain token replace rather than %-formatting so a future stray "%"
+        # can never turn this into a broken format string.
         js_seek_live = """
         (function(){
-            const v = document.querySelector('video');
-            if (!v) return 'no-video';
-            // STRICT live detection: only true livestreams report an infinite
-            // duration. We deliberately do NOT rely on the .ytp-live CSS class,
-            // which can linger on past-stream VODs and hijack a %s start.
-            if (v.duration !== Infinity) return 'not-live';
-            // Clicking the LIVE badge seeks to the live head; no-ops at head.
-            const badge = document.querySelector('.ytp-live-badge');
-            if (badge) { try { badge.click(); } catch(e){} }
-            // Fallback: hard-seek to the end of the seekable range.
-            try {
-                if (v.seekable && v.seekable.length) {
-                    v.currentTime = v.seekable.end(v.seekable.length - 1);
+            var TICK_MS = 1000;
+            var MAX_TICKS = __MAX_TICKS__;
+            // How far (seconds) behind the live head we tolerate before nudging
+            // back. A few seconds of normal live latency must NOT trigger a
+            // reseek; only a real resume/DVR jump (much larger) should.
+            var DRIFT_TOLERANCE = 10;
+            // After a correction, wait this many ticks before re-evaluating so
+            // the seek + rebuffer can actually complete. Re-checking too soon is
+            // what caused the past<->live ping-pong (currentTime lags the seek).
+            var COOLDOWN_TICKS = 4;
+            // Upper bound on corrections: if YouTube keeps yanking the position
+            // back, give up rather than oscillate forever.
+            var MAX_CORRECTIONS = 3;
+
+            // Idempotency guard: this runs on the initial show AND on every
+            // swap, so never stack multiple watchdogs on the same page.
+            if (window.__forceLiveWatchdog) return 'already-running';
+
+            function isLiveNow(){
+                // Primary signal: YouTube's own player API. isLive is true ONLY
+                // for a currently-running broadcast; past-stream VODs and %s
+                // random-start VODs report false, so we leave them alone.
+                try {
+                    var p = document.getElementById('movie_player');
+                    if (p && typeof p.getVideoData === 'function') {
+                        var d = p.getVideoData();
+                        if (d && typeof d.isLive === 'boolean') return d.isLive;
+                    }
+                } catch(e){}
+                // Fallbacks only when the API is not exposed yet: an infinite
+                // duration is a genuine live signal, as is a visible LIVE badge.
+                var v = document.querySelector('video');
+                if (v && v.duration === Infinity) return true;
+                if (document.querySelector('.ytp-live-badge')) return true;
+                return false;
+            }
+
+            function driftFromLive(){
+                var v = document.querySelector('video');
+                try {
+                    if (v && v.seekable && v.seekable.length) {
+                        return v.seekable.end(v.seekable.length - 1) - v.currentTime;
+                    }
+                } catch(e){}
+                return 0;
+            }
+
+            function goLive(){
+                // Prefer YouTube's own "jump to live": clicking the LIVE badge
+                // is a single, smooth catch-up and is the least jarring option.
+                var badge = document.querySelector('.ytp-live-badge');
+                if (badge) { try { badge.click(); return; } catch(e){} }
+                // Only when the badge isn't present do we fall back to ONE hard
+                // seek to the end of the seekable range (never in combination).
+                var v = document.querySelector('video');
+                try {
+                    var p = document.getElementById('movie_player');
+                    if (p && typeof p.seekTo === 'function' && v && v.seekable && v.seekable.length) {
+                        p.seekTo(v.seekable.end(v.seekable.length - 1), true);
+                        return;
+                    }
+                } catch(e){}
+                try {
+                    if (v && v.seekable && v.seekable.length) {
+                        v.currentTime = v.seekable.end(v.seekable.length - 1);
+                    }
+                } catch(e){}
+            }
+
+            var ticks = 0;
+            var corrections = 0;
+            var cooldown = 0;
+            window.__forceLiveWatchdog = setInterval(function(){
+                ticks++;
+                // Hard time cap so the watchdog can never linger.
+                if (ticks > MAX_TICKS) {
+                    clearInterval(window.__forceLiveWatchdog);
+                    window.__forceLiveWatchdog = null;
+                    return;
                 }
-            } catch(e){}
-            return 'sought-live';
+                // Wait quietly on non-live pages (metadata may still be loading;
+                // VOD/%s stay false forever and are never touched).
+                if (!isLiveNow()) return;
+                // Let the previous correction settle before judging drift again.
+                if (cooldown > 0) { cooldown--; return; }
+
+                if (driftFromLive() > DRIFT_TOLERANCE) {
+                    // Genuine backward jump (YouTube resumed a remembered spot).
+                    if (corrections >= MAX_CORRECTIONS) {
+                        clearInterval(window.__forceLiveWatchdog);
+                        window.__forceLiveWatchdog = null;
+                        return;
+                    }
+                    goLive();
+                    corrections++;
+                    cooldown = COOLDOWN_TICKS;
+                } else if (corrections > 0) {
+                    // We corrected and it stuck at the head -> done, stop early
+                    // (no more seeking -> no ping-pong).
+                    clearInterval(window.__forceLiveWatchdog);
+                    window.__forceLiveWatchdog = null;
+                }
+                // else: at the head but never corrected -> keep watching for a
+                // late resume until MAX_TICKS, doing nothing (no visible jump).
+            }, TICK_MS);
+            return 'watchdog-armed';
         })();
-        """
+        """.replace("__MAX_TICKS__", str(int(FORCE_LIVE_WATCHDOG_SECONDS)))
 
         try:
             mw.page_conn.call(

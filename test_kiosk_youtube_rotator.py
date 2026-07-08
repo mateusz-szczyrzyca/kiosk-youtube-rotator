@@ -1127,10 +1127,11 @@ class TestSeekPlayerToLive:
         assert params.get("awaitPromise") is False
         assert isinstance(params.get("expression"), str)
 
-    def test_detection_is_strictly_infinite_duration(self):
-        # Regression guard for the core invariant: live detection keys off the
-        # infinite-duration signal, NOT the .ytp-live CSS class (which can
-        # linger on past-stream VODs and would wrongly hijack a %s start).
+    def test_infinite_duration_kept_only_as_fallback_signal(self):
+        # The infinite-duration check survives as a *fallback* live signal (for
+        # when the player API is not yet exposed), but the bare .ytp-live CSS
+        # class must never be a detection gate -- it can linger on past-stream
+        # VODs and would wrongly hijack a %s start.
         conn = _RecordingConn()
         _run_seek_to_live(conn)
         expr = conn.calls[0][1]["expression"]
@@ -1141,6 +1142,17 @@ class TestSeekPlayerToLive:
         assert "'.ytp-live'" not in expr
         assert '".ytp-live"' not in expr
 
+    def test_primary_detection_uses_player_isLive_api(self):
+        # The core fix: DVR-enabled livestreams (the ones YouTube "remembers")
+        # report a FINITE duration, so detection must key off the player API's
+        # isLive flag rather than the old duration-only gate.
+        conn = _RecordingConn()
+        _run_seek_to_live(conn)
+        expr = conn.calls[0][1]["expression"]
+        assert "getVideoData" in expr
+        assert "isLive" in expr
+        assert "movie_player" in expr
+
     def test_seeks_to_live_head_via_badge_and_seekable_fallback(self):
         conn = _RecordingConn()
         _run_seek_to_live(conn)
@@ -1150,6 +1162,44 @@ class TestSeekPlayerToLive:
         # Fallback path: hard-seek to the end of the seekable range.
         assert "seekable" in expr
         assert "currentTime" in expr
+
+    def test_installs_self_clearing_watchdog(self):
+        # Because YouTube restores a remembered position asynchronously, a
+        # single seek is not enough: the JS installs a repeating watchdog that
+        # also tears itself down when its window elapses.
+        conn = _RecordingConn()
+        _run_seek_to_live(conn)
+        expr = conn.calls[0][1]["expression"]
+        assert "setInterval" in expr
+        assert "clearInterval" in expr
+
+    def test_watchdog_is_idempotent(self):
+        # seek_player_to_live runs on the initial show AND on every swap, so the
+        # in-page guard must prevent stacking multiple watchdogs.
+        conn = _RecordingConn()
+        _run_seek_to_live(conn)
+        expr = conn.calls[0][1]["expression"]
+        assert "__forceLiveWatchdog" in expr
+
+    def test_watchdog_length_is_injected_from_constant(self):
+        # The tunable watchdog length must reach the in-page loop; the token
+        # placeholder must be fully substituted (no leftover marker).
+        conn = _RecordingConn()
+        _run_seek_to_live(conn)
+        expr = conn.calls[0][1]["expression"]
+        assert "__MAX_TICKS__" not in expr
+        assert str(int(ry.FORCE_LIVE_WATCHDOG_SECONDS)) in expr
+
+    def test_watchdog_is_gentle_with_cooldown_and_bounded_corrections(self):
+        # Regression guard for the past<->live ping-pong: after a correction the
+        # watchdog must hold a cooldown (so the seek can settle before the next
+        # check) and cap the number of corrections rather than hammering the
+        # player every tick.
+        conn = _RecordingConn()
+        _run_seek_to_live(conn)
+        expr = conn.calls[0][1]["expression"]
+        assert "cooldown" in expr
+        assert "MAX_CORRECTIONS" in expr
 
     def test_cdp_failure_is_non_fatal(self):
         # A failing CDP call must never bubble up and break the rotation loop.

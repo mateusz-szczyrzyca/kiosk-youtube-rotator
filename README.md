@@ -171,9 +171,17 @@ for the jazz list, less so for wildlife cams).
 By default the rotator forces **livestreams** to the live head each time they
 come to the foreground, so a live cam never lingers on a buffered/old DVR
 position (YouTube can otherwise resume a stream minutes — or a day — behind
-live). This only affects genuine livestreams; regular videos, including `%s`
-random-start links, keep their chosen start position. Pass `--no-force-live` to
-turn it off and allow normal DVR behavior.
+live). Livestreams are detected via YouTube's own player API (so this also
+covers **DVR-enabled** streams, which report a *finite* duration and used to
+slip through). Because YouTube restores that remembered position a moment
+*after* the page loads, a short in-page watchdog watches for the backward jump
+and, once playback settles, makes a **single, gentle** correction to the live
+head (YouTube's own "go to live" catch-up), then stops as soon as the stream
+sticks — it does not repeatedly seek, so there is no visible past↔live
+flicker. This only affects genuine, currently-running livestreams; regular
+videos, including `%s` random-start links and finished streams that became
+recordings, keep their chosen start position. Pass `--no-force-live` to turn it
+off and allow normal DVR behavior.
 
 ## Input files
 
