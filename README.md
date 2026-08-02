@@ -84,8 +84,9 @@ will change and "something new" will come on.
 ### Self-update (opt-in)
 
 Pass `--self-update` to have the script keep *itself* fresh. At startup it
-fetches its own newer copy from the repository (default: the raw GitHub `main`
-file; override with `--self-update-url`), and:
+fetches its own newer copy from the repository (default: the **GitHub API
+contents endpoint** for the `main` branch; override with `--self-update-url`),
+and:
 
 - if a **newer version** is found, it downloads it, **atomically replaces** the
   file on disk (a `.part` temp file is `os.replace`d in, so an interrupted write
@@ -101,6 +102,17 @@ Detection is a byte-for-byte comparison against the local file, so no version
 bookkeeping is needed. A re-exec guard makes the freshly-restarted (already
 updated) process skip the check exactly once, preventing an update→restart loop.
 Off by default.
+
+The GitHub **API** contents endpoint is used on purpose instead of
+`raw.githubusercontent.com`: the raw host is CDN-cached for ~5 minutes, so right
+after a push it can serve a stale copy identical to your local file and the
+update would silently do nothing. The API endpoint returns byte-identical
+content but is fresh within ~60 seconds, so a just-pushed version is picked up
+on the next start. Unauthenticated GitHub API requests are rate-limited
+(60/hour per IP); a rate-limited or unreachable check is logged and simply falls
+back to the current version. Every start prints a `[INFO] Self-update: ...`
+status line (checking / already latest / newer version found), so you can always
+tell from the log what the check decided.
 
 > **Platform:** Primary target is Windows 10/11 (process handling,
 > `tasklist`/`taskkill`, the default profile path). It also runs on Linux
@@ -277,7 +289,7 @@ https://www.youtube.com/watch?v=ygedg03NpUQ
 | `--profile-directory NAME` | `Default` | Profile directory name inside *User Data* (e.g. `Default`, `Profile 1`). |
 | `--force-close-chrome` | off | With `--use-default-profile`, force-close running Chrome first. |
 | `--self-update` | off | At startup, check the repository for a newer version of this script; if found, download it, replace the file, and restart with the same arguments (stdout logging is preserved). Falls back to the current version if the repo is unreachable within 5s or there is no new version. |
-| `--self-update-url URL` | raw GitHub `main` | URL to fetch the newer script from when `--self-update` is used. |
+| `--self-update-url URL` | GitHub API contents endpoint (`main`) | URL to fetch the newer script from when `--self-update` is used. |
 
 By default the script uses a **separate, private Chrome profile** in
 `./chrome_profile`, so it never touches your everyday Chrome. Use

@@ -1273,6 +1273,28 @@ class TestFetchRemoteScript:
         ry.fetch_remote_script("https://x/script.py", timeout=1.25)
         assert captured["timeout"] == 1.25
 
+    def test_sends_github_raw_accept_header(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_get(u, **k):
+            captured["headers"] = k.get("headers")
+            return _FakeResponse(b"data")
+
+        monkeypatch.setattr(ry.requests, "get", fake_get)
+        ry.fetch_remote_script("https://x/script.py")
+        # The GitHub API needs this Accept to return the raw file body rather
+        # than its JSON metadata wrapper.
+        assert captured["headers"]["Accept"] == "application/vnd.github.raw"
+
+
+class TestSelfUpdateDefaultUrl:
+    def test_default_url_uses_github_api_not_cache_stale_raw(self):
+        # raw.githubusercontent.com has a 5-minute CDN cache that made the
+        # update silently no-op right after a push; the API endpoint is fresh
+        # within ~60s. Guard against regressing back to the raw host.
+        assert "api.github.com" in ry.SELF_UPDATE_URL_DEFAULT
+        assert "raw.githubusercontent.com" not in ry.SELF_UPDATE_URL_DEFAULT
+
 
 # ---------------------------------------------------------------------------
 # Self-update: is_new_version
@@ -1345,7 +1367,7 @@ class TestApplySelfUpdate:
 
 
 class TestCheckAndApplySelfUpdate:
-    def test_unreachable_repo_returns_false_and_keeps_file(self, tmp_path: Path, monkeypatch):
+    def test_unreachable_repo_returns_false_and_keeps_file(self, tmp_path: Path, monkeypatch, capsys):
         local = tmp_path / "script.py"
         local.write_bytes(b"current\n")
 
@@ -1355,8 +1377,10 @@ class TestCheckAndApplySelfUpdate:
         monkeypatch.setattr(ry.requests, "get", boom)
         assert ry.check_and_apply_self_update(local, "https://x/script.py") is False
         assert local.read_bytes() == b"current\n"
+        # The check must announce itself even when the fetch fails.
+        assert "checking" in capsys.readouterr().out
 
-    def test_identical_remote_returns_false_and_keeps_file(self, tmp_path: Path, monkeypatch):
+    def test_identical_remote_returns_false_and_keeps_file(self, tmp_path: Path, monkeypatch, capsys):
         local = tmp_path / "script.py"
         local.write_bytes(b"current\n")
         monkeypatch.setattr(
@@ -1364,8 +1388,10 @@ class TestCheckAndApplySelfUpdate:
         )
         assert ry.check_and_apply_self_update(local, "https://x/script.py") is False
         assert local.read_bytes() == b"current\n"
+        # The "unchanged" path must no longer be silent.
+        assert "already running the latest version" in capsys.readouterr().out
 
-    def test_newer_remote_updates_file_and_returns_true(self, tmp_path: Path, monkeypatch):
+    def test_newer_remote_updates_file_and_returns_true(self, tmp_path: Path, monkeypatch, capsys):
         local = tmp_path / "script.py"
         local.write_bytes(b"current\n")
         monkeypatch.setattr(
@@ -1373,6 +1399,7 @@ class TestCheckAndApplySelfUpdate:
         )
         assert ry.check_and_apply_self_update(local, "https://x/script.py") is True
         assert local.read_bytes() == b"brand-new\n"
+        assert "newer version found" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
