@@ -140,6 +140,17 @@ On Linux the launcher adapts automatically:
   sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
   ```
 
+- **Staying logged in (cookies / no ads):** Chrome encrypts its cookie store
+  with a key kept in the Secret Service keyring (`gnome-keyring`/`kwallet`). A
+  kiosk box usually has no *unlocked* keyring (auto-login doesn't unlock it), so
+  Chrome can't decrypt the saved Google session cookies and YouTube/Gmail come
+  up **logged out** — which means ads. To avoid this, `--password-store=basic`
+  is passed by default on Linux: it uses a fixed, keyring-independent key so the
+  login persists across restarts. Override with `--password-store gnome`
+  (`kwallet`, `detect`, …) if you *do* have an unlocked keyring. Because cookies
+  encrypted under one store can't be read under another — and macOS/Windows use
+  the Keychain/DPAPI, not this key — **a profile copied from mac/Windows won't
+  carry the login; log in once on the Ubuntu box after first launch.**
 - **Wayland/X11:** `--ozone-platform-hint=auto` is passed so Chrome picks the
   right backend on Wayland-default sessions.
 - **Single-window / tab handoff (default on Linux):** Wayland deliberately does
@@ -280,6 +291,7 @@ https://www.youtube.com/watch?v=ygedg03NpUQ
 | `--sandbox` / `--no-sandbox` | auto | Enable/disable Chrome's sandbox. Auto = disabled on Linux (needed for non-snap Chromium on Ubuntu 24.04+/26.04), untouched elsewhere. |
 | `--single-window` / `--no-single-window` | auto | Run in one kiosk window and switch videos via tabs (reliable under Wayland), or use a separate window per video. Auto = on for Linux, off on Windows/macOS. |
 | `--force-x11` | off | Linux only: force Chrome's X11/XWayland backend (`--ozone-platform=x11`) as a fallback for Wayland window quirks. |
+| `--password-store {auto,basic,gnome,kwallet,detect,…}` | `auto` | Linux only: cookie/credential encryption backend. Auto = `basic` on Linux so the Google login survives restarts without an unlocked keyring (otherwise YouTube/Gmail log out → ads); ignored on Windows/macOS. Log in once after changing it. |
 | `--remote-port N` | `9222` | Chrome remote-debugging port. |
 | `--player-fullscreen` | off | Toggle the YouTube player to fullscreen. |
 | `--force-live` / `--no-force-live` | on | For livestreams, seek to the live head instead of a buffered/resumed position. No-op for regular videos (including `%s` random-start links). |

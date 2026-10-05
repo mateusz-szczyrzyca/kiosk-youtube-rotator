@@ -280,6 +280,7 @@ def start_chrome(
     profile_directory: Optional[str] = None,
     no_sandbox: Optional[bool] = None,
     force_x11: bool = False,
+    password_store: Optional[str] = None,
 ) -> subprocess.Popen[Any]:
     """Start Chrome with remote debugging and return the Popen object.
 
@@ -296,6 +297,16 @@ def start_chrome(
     ``force_x11`` (Linux only) pins Chrome's Ozone backend to X11/XWayland
     instead of letting it auto-pick Wayland. It exists as a fallback for the
     window-management quirks of Wayland; on non-Linux platforms it is ignored.
+
+    ``password_store`` (Linux only) selects Chrome's cookie/credential
+    encryption backend via ``--password-store``. ``None`` means "auto": on Linux
+    we force ``basic`` because kiosk boxes typically have no unlocked Secret
+    Service keyring (gnome-keyring/kwallet), and without it Chrome cannot decrypt
+    the saved Google session cookies across restarts, so YouTube/Gmail appear
+    logged out (and play ads). ``basic`` uses a fixed, keyring-independent key so
+    the login persists. Pass an explicit value (e.g. ``gnome``, ``kwallet``,
+    ``detect``) to override. On non-Linux platforms this is ignored because
+    macOS (Keychain) and Windows (DPAPI) already provide an always-available key.
     """
     is_linux = sys.platform.startswith("linux")
 
@@ -328,6 +339,13 @@ def start_chrome(
         # short on a particular setup.
         if force_x11:
             args.append("--ozone-platform=x11")
+        # Pin the cookie encryption backend. Default to "basic" on Linux: a
+        # kiosk box usually has no unlocked keyring, so the keyring-backed
+        # stores (gnome/kwallet) can't return the key Chrome used to encrypt the
+        # Google session cookies, which silently drops the login (→ ads). "basic"
+        # uses a fixed key and keeps the login across restarts without a keyring.
+        store = "basic" if password_store is None else password_store
+        args.append(f"--password-store={store}")
 
     # Open a blank page at launch: we reuse this very window (navigating it to
     # the first video) instead of spawning a second one, so there is never an
@@ -2008,6 +2026,31 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--password-store",
+        type=str,
+        choices=[
+            "auto",
+            "basic",
+            "gnome",
+            "gnome-libsecret",
+            "kwallet",
+            "kwallet5",
+            "kwallet6",
+            "detect",
+        ],
+        default="auto",
+        help=(
+            "Linux only: Chrome's cookie/credential encryption backend "
+            "(--password-store). Default (auto): 'basic' on Linux because a "
+            "kiosk box usually has no unlocked keyring, so a keyring-backed "
+            "store can't decrypt the saved Google session cookies and "
+            "YouTube/Gmail appear logged out (and play ads). Override with e.g. "
+            "'gnome'/'kwallet'/'detect'. Ignored on Windows/macOS. Note: cookies "
+            "encrypted under one store can't be read under another, so log in "
+            "once after changing this."
+        ),
+    )
+    parser.add_argument(
         "--self-update",
         action="store_true",
         help=(
@@ -2221,6 +2264,12 @@ def main() -> None:
     else:
         no_sandbox_choice = not args.sandbox
 
+    # Resolve the password-store choice: "auto" (None) lets start_chrome pick the
+    # per-platform default (basic on Linux), any explicit value is passed through.
+    password_store_choice: Optional[str] = (
+        None if args.password_store == "auto" else args.password_store
+    )
+
     try:
         # Start Chrome and connect to CDP
         chrome_proc = start_chrome(
@@ -2230,6 +2279,7 @@ def main() -> None:
             profile_directory=profile_directory,
             no_sandbox=no_sandbox_choice,
             force_x11=args.force_x11,
+            password_store=password_store_choice,
         )
         try:
             controller = ChromeController(args.remote_port)

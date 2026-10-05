@@ -382,6 +382,34 @@ class TestStartChrome:
         args = captured["args"]
         assert "--no-sandbox" not in args
         assert "--ozone-platform-hint=auto" not in args
+        # The cookie-store pin is a Linux-only workaround; macOS/Windows already
+        # have an always-available key (Keychain/DPAPI), so we leave it off.
+        assert not any(a.startswith("--password-store=") for a in args)
+
+    def test_linux_pins_basic_password_store_by_default(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # Without a value we default to "basic" on Linux: a kiosk box has no
+        # unlocked keyring, so a keyring-backed store can't decrypt the saved
+        # Google session cookies and YouTube/Gmail appear logged out (ads).
+        captured = self._capture(monkeypatch)
+        monkeypatch.setattr(ry.sys, "platform", "linux")
+        monkeypatch.setattr(ry.os, "name", "posix")
+        ry.start_chrome("/usr/bin/chromium", 9222, tmp_path)
+        assert "--password-store=basic" in captured["args"]
+
+    def test_linux_password_store_can_be_overridden(
+        self, monkeypatch, tmp_path: Path
+    ):
+        captured = self._capture(monkeypatch)
+        monkeypatch.setattr(ry.sys, "platform", "linux")
+        monkeypatch.setattr(ry.os, "name", "posix")
+        ry.start_chrome(
+            "/usr/bin/chromium", 9222, tmp_path, password_store="gnome"
+        )
+        args = captured["args"]
+        assert "--password-store=gnome" in args
+        assert "--password-store=basic" not in args
 
     def test_launches_blank_page(self, monkeypatch, tmp_path: Path):
         # We reuse the launch window for the first video, so it must open a bare
